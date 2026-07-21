@@ -73,7 +73,7 @@ class Ctx:
         if style == "numeric":
             return "$%d" % idx
         if style == "format":
-            return "%s"
+            return "\x00pydal_param_%d\x00" % idx
         if style == "pyformat":
             return "%%(p%d)s" % idx
         raise ValueError("unknown placeholder_style %r" % style)
@@ -88,7 +88,7 @@ class Ctx:
 _PARAMETERIZABLE_TYPES = frozenset(
     {
         "string", "text", "password",
-        "integer", "bigint",
+        "id", "big-id", "integer", "bigint",
         "float", "double",
         "boolean",
         "date", "time", "datetime",
@@ -176,6 +176,10 @@ class SQLCompiler:
         self._ctx = None
         if ctx is None:
             return sql
+        if ctx.placeholder_style == "format" and ctx.params:
+            sql = sql.replace("%", "%%")
+            for idx in range(1, len(ctx.params) + 1):
+                sql = sql.replace("\x00pydal_param_%d\x00" % idx, "%s")
         return ParamSQL(sql, ctx.params)
 
     def compile_expression(self, node: ast.Node):
@@ -190,7 +194,7 @@ class SQLCompiler:
             sql = self.visit(node)
         finally:
             self._ctx = None
-        return ParamSQL(sql, ctx.params) if ctx is not None else sql
+        return self._finish(sql, ctx)
 
     # ----- statement entry points (Layer 2c) -----
 
@@ -207,7 +211,7 @@ class SQLCompiler:
             sql = self._compile_select_body(n)
         finally:
             self._ctx = None
-        return ParamSQL(sql, ctx.params) if ctx is not None else sql
+        return self._finish(sql, ctx)
 
     def _emit_limitby(self, n: ast.Select, dst: str):
         """Return ``(dst, limit_clause, offset_clause)`` for the limit/offset part.
@@ -393,10 +397,14 @@ class SQLCompiler:
                     raise NotImplementedError("multi-row INSERT not yet supported")
                 cols = ",".join(self._column_sql(n.table, c) for c in n.cols)
                 values = ",".join(self.visit(v) for v in n.rows[0])
-                sql = "INSERT INTO %s(%s) VALUES (%s);" % (table, cols, values)
+                sql = self._render_insert(n, table, cols, values)
         finally:
             self._ctx = None
-        return ParamSQL(sql, ctx.params) if ctx is not None else sql
+        return self._finish(sql, ctx)
+
+    def _render_insert(self, n: ast.Insert, table: str, cols: str, values: str) -> str:
+        """Assemble an INSERT statement for a non-empty row."""
+        return "INSERT INTO %s(%s) VALUES (%s);" % (table, cols, values)
 
     def compile_update(self, n: ast.Update):
         """
@@ -420,7 +428,7 @@ class SQLCompiler:
         finally:
             self._scope_stack.pop()
             self._ctx = None
-        return ParamSQL(sql, ctx.params) if ctx is not None else sql
+        return self._finish(sql, ctx)
 
     def _render_update(self, n: ast.Update, table: str, sets: str, whr: str) -> str:
         """Assemble the final UPDATE statement. Subclasses override to emit
@@ -438,7 +446,7 @@ class SQLCompiler:
         finally:
             self._scope_stack.pop()
             self._ctx = None
-        return ParamSQL(sql, ctx.params) if ctx is not None else sql
+        return self._finish(sql, ctx)
 
     def _render_delete(self, n: ast.Delete, table: str, whr: str) -> str:
         """Assemble the final DELETE statement. Subclasses override to emit
@@ -466,7 +474,7 @@ class SQLCompiler:
         finally:
             self._scope_stack.pop()
             self._ctx = None
-        return ParamSQL(sql, ctx.params) if ctx is not None else sql
+        return self._finish(sql, ctx)
 
     # ------------------------------------------------------------------ utils
     def q(self, name: str) -> str:
@@ -554,7 +562,10 @@ class SQLCompiler:
             self._ctx is not None
             and n.value is not None
             and isinstance(n.type, str)
-            and (n.type in _PARAMETERIZABLE_TYPES or n.type.startswith("decimal"))
+            and (
+                n.type in _PARAMETERIZABLE_TYPES
+                or n.type.startswith(("decimal", "reference ", "big-reference "))
+            )
         ):
             return self._ctx.bind(self._adapt_for_bind(n.value, n.type))
         if n.type:
@@ -578,6 +589,22 @@ class SQLCompiler:
         * ``datetime`` -> ``"YYYY-MM-DD<sep>HH:MM:SS"``
         * everything else: passthrough (driver handles native types).
         """
+        if type_ in ("string", "text", "password"):
+            return str(value)
+        if type_ in ("id", "big-id"):
+            return int(value)
+        if type_.startswith(("reference ", "big-reference ")):
+            offset = 10 if type_.startswith("reference ") else 14
+            referenced = type_[offset:].strip()
+            if self.adapter is not None and "." in referenced:
+                tablename, fieldname = referenced.split(".", 1)
+                try:
+                    target_type = self.adapter.db[tablename][fieldname].type
+                except (KeyError, AttributeError):
+                    pass
+                else:
+                    return self._adapt_for_bind(value, target_type)
+            return int(value)
         if type_ == "boolean":
             if value and str(value)[:1].upper() not in "0F":
                 return self.true_token
@@ -836,12 +863,12 @@ class SQLCompiler:
         doubled in a *literal* pattern (``None`` when an explicit ESCAPE was
         supplied, so the pattern is taken verbatim)."""
         if isinstance(r, ast.Literal):
-            rendered = str(self._represent(r.value, r.type or "string"))
+            value = str(r.value)
             if lowered_left:
-                rendered = rendered.lower()
+                value = value.lower()
             if escape_to_double is not None:
-                rendered = rendered.replace(escape_to_double, escape_to_double * 2)
-            return rendered
+                value = value.replace(escape_to_double, escape_to_double * 2)
+            return self.visit(ast.Literal(value, r.type or "string"))
         return self.visit(r)
 
     def op_like(self, l, r, opts):
@@ -859,7 +886,7 @@ class SQLCompiler:
         pat = self._like_escape(str(r.value)) + "%"
         return "(%s LIKE %s ESCAPE '\\')" % (
             self.visit(l),
-            self._represent(pat, "string"),
+            self.visit(ast.Literal(pat, "string")),
         )
 
     def op_endswith(self, l, r, _):
@@ -869,7 +896,7 @@ class SQLCompiler:
         pat = "%" + self._like_escape(str(r.value))
         return "(%s LIKE %s ESCAPE '\\')" % (
             self.visit(l),
-            self._represent(pat, "string"),
+            self.visit(ast.Literal(pat, "string")),
         )
 
     def op_contains(self, l, r, opts):
@@ -1002,7 +1029,7 @@ class SQLCompiler:
             type_ = {bool: "boolean", int: "integer", float: "double"}.get(
                 type(v), "string"
             )
-            return str(self._represent(v, type_))
+            return self.visit(ast.Literal(v, type_))
         return self.visit(node)
 
 
