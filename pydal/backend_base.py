@@ -675,6 +675,7 @@ class BaseAdapter(ConnectionPool, metaclass=AdapterMeta):
     drivers = ()
     uploads_in_blob = False
     support_distributed_transaction = False
+    supports_atomic_upsert = False
 
     def __init__(
         self,
@@ -1215,6 +1216,11 @@ class SQLAdapter(BaseAdapter):
         rid = Reference(id)
         (rid._table, rid._record) = (table, None)
         return rid
+
+    def upsert(self, table, conflict_fields, fields):
+        raise NotImplementedError(
+            "%s adapter does not support atomic upsert" % self.dbengine
+        )
 
     def _update(self, table, query, fields):
         if self.compiler is not None:

@@ -319,6 +319,27 @@ db.person.update_or_insert(db.person.name == "John",
                            name="John", age=30)
 ```
 
+PostgreSQL also provides an atomic upsert with an explicit conflict target.
+The fields may be passed as `Field` objects, names, or a mixture, and must
+match a primary key or non-partial unique constraint/index:
+
+```python
+rid = db.person.upsert(
+  [db.person.tenant, "email"],
+  tenant="acme",
+  email="alex@example.com",
+  name="Alex",
+)
+```
+
+`upsert` returns the record ID for both inserts and updates. It applies insert
+defaults, computed fields, and insert callbacks; update callbacks are not run.
+ID and conflict fields are excluded from the update. If no other fields remain,
+PostgreSQL performs a self-assignment of the first conflict field so that
+`RETURNING` can still provide the existing ID; this fires normal PostgreSQL
+update triggers. Other adapters raise `NotImplementedError`. The existing
+`update_or_insert` behavior is unchanged.
+
 `validate_and_insert` / `validate_and_update` run the field validators
 first and return `{"id": …, "errors": {…}, "success": bool}`.
 

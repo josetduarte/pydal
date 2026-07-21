@@ -6,9 +6,11 @@
 
 import os.path
 import re
+import sys
 
 from .._globals import IDENTITY, THREAD_LOCAL
 from ..drivers import psycopg2_adapt
+from ..helpers.classes import Reference
 from ..utils import split_uri_args
 from ..backend_base import AdapterMeta, adapters, with_connection, with_connection_or_raise
 from ..backend_base import SQLAdapter
@@ -54,6 +56,7 @@ class Postgres(SQLAdapter, metaclass=PostgresMeta):
     dbengine = "postgres"
     drivers = ("psycopg2",)
     support_distributed_transaction = True
+    supports_atomic_upsert = True
 
     REGEX_URI = (
         "^(?P<user>[^:@]+)(:(?P<password>[^@]*))?"
@@ -178,6 +181,76 @@ class Postgres(SQLAdapter, metaclass=PostgresMeta):
                 retval,
             )
         return self.dialect.insert_empty(table._rname)
+
+    def _upsert(self, table, conflict_fields, fields):
+        target_alias = self.dialect.quote("_pydal_upsert")
+        if fields:
+            insert_sql = "INSERT INTO %s AS %s(%s) VALUES (%s)" % (
+                table._rname,
+                target_alias,
+                ",".join(field._rname for field, value in fields),
+                ",".join(self.expand(value, field.type) for field, value in fields),
+            )
+        else:
+            insert_sql = "INSERT INTO %s AS %s DEFAULT VALUES" % (
+                table._rname,
+                target_alias,
+            )
+
+        primary_names = set(getattr(table, "_primarykey", []))
+        if not primary_names and hasattr(table, "_id"):
+            primary_names.add(table._id.name)
+        conflict_names = {field.name for field in conflict_fields}
+        update_fields = [
+            field
+            for field, value in fields
+            if field.name not in primary_names and field.name not in conflict_names
+        ]
+        if update_fields:
+            assignments = ",".join(
+                "%s=EXCLUDED.%s" % (field._rname, field._rname)
+                for field in update_fields
+            )
+        else:
+            field_name = conflict_fields[0]._rname
+            assignments = "%s=%s.%s" % (
+                field_name,
+                target_alias,
+                field_name,
+            )
+
+        if hasattr(table, "_primarykey"):
+            returning_fields = [table[name] for name in table._primarykey]
+        else:
+            returning_fields = [table._id]
+        return (
+            "%s ON CONFLICT (%s) DO UPDATE SET %s RETURNING %s;"
+            % (
+                insert_sql,
+                ",".join(field._rname for field in conflict_fields),
+                assignments,
+                ",".join(field._rname for field in returning_fields),
+            )
+        )
+
+    def upsert(self, table, conflict_fields, fields):
+        query = self._upsert(table, conflict_fields, fields)
+        try:
+            self.execute(query)
+        except Exception:
+            error = sys.exc_info()[1]
+            if hasattr(table, "_on_insert_error"):
+                return table._on_insert_error(table, fields, error)
+            raise error
+
+        values = self.cursor.fetchone()
+        if values is None:
+            return None
+        if hasattr(table, "_primarykey"):
+            return dict(zip(table._primarykey, values))
+        record_id = Reference(int(values[0]))
+        record_id._table, record_id._record = table, None
+        return record_id
 
     @with_connection
     def prepare(self, key):

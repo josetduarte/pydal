@@ -333,6 +333,7 @@ class Table(Serializable, BasicStorage):
     Public surface:
 
     * ``insert`` / ``bulk_insert`` / ``_insert`` (SQL-only).
+    * ``upsert`` on adapters with atomic upsert support (currently PostgreSQL).
     * ``update_or_insert`` / ``validate_and_insert`` /
       ``validate_and_update`` / ``validate_and_update_or_insert``.
     * ``drop`` / ``_drop``.
@@ -992,6 +993,56 @@ class Table(Serializable, BasicStorage):
             for f in self._after_insert:
                 f(row, ret)
         return ret
+
+    def upsert(self, conflict_fields, **values):
+        """Atomically insert or update a record on a declared conflict target.
+
+        This uses insert defaults, computed fields, and insert callbacks for both
+        outcomes. Update callbacks are not run because the database decides which
+        outcome occurs while executing the statement. Only adapters advertising
+        atomic upsert support implement this operation.
+        """
+        if isinstance(conflict_fields, (Field, str)):
+            conflict_fields = [conflict_fields]
+        else:
+            try:
+                conflict_fields = list(conflict_fields)
+            except TypeError:
+                raise TypeError("conflict_fields must contain Field objects or names")
+        if not conflict_fields:
+            raise ValueError("conflict_fields must contain at least one field")
+
+        resolved_fields = []
+        resolved_names = set()
+        for item in conflict_fields:
+            if isinstance(item, str):
+                if item not in self.fields:
+                    raise ValueError("unknown conflict field: %s" % item)
+                field = self[item]
+            elif isinstance(item, Field):
+                if item.name not in self.fields or self[item.name] is not item:
+                    raise ValueError("conflict field does not belong to this table")
+                field = item
+            else:
+                raise TypeError("conflict_fields must contain Field objects or names")
+            if field.name in resolved_names:
+                raise ValueError("duplicate conflict field: %s" % field.name)
+            resolved_fields.append(field)
+            resolved_names.add(field.name)
+
+        adapter = self._db._adapter
+        if not adapter.supports_atomic_upsert:
+            raise NotImplementedError(
+                "%s adapter does not support atomic upsert" % adapter.dbengine
+            )
+        row = self._fields_and_values_for_insert(values)
+        if any(callback(row) for callback in self._before_insert):
+            return 0
+        record_id = adapter.upsert(self, resolved_fields, row.op_values())
+        if record_id and self._after_insert:
+            for callback in self._after_insert:
+                callback(row, record_id)
+        return record_id
 
     def _validate_fields(self, fields, record=None):
         # do not change the input

@@ -3624,6 +3624,256 @@ class TestUpdateInsert(DALtest):
         self.assertTrue(db(t0.name == "web2py2").count() == 1)
 
 
+class TestUpsertAPI(unittest.TestCase):
+    def setUp(self):
+        self.db = DAL("sqlite:memory")
+        self.table = self.db.define_table("upsert_api", Field("name", unique=True))
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_requires_conflict_fields(self):
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            self.table.upsert([], name="alice")
+
+    def test_accepts_field_names_and_rejects_foreign_fields(self):
+        other = self.db.define_table("upsert_other", Field("name"))
+        with self.assertRaisesRegex(NotImplementedError, "atomic upsert"):
+            self.table.upsert("name", name="alice")
+        with self.assertRaisesRegex(ValueError, "does not belong"):
+            self.table.upsert(other.name, name="alice")
+        with self.assertRaisesRegex(ValueError, "duplicate conflict field"):
+            self.table.upsert(["name", self.table.name], name="alice")
+
+    def test_unsupported_adapter_does_not_run_callbacks(self):
+        calls = []
+        self.table._before_insert.append(lambda row: calls.append(row))
+        with self.assertRaisesRegex(NotImplementedError, "sqlite adapter"):
+            self.table.upsert(self.table.name, name="alice")
+        self.assertEqual(calls, [])
+
+    def test_supported_adapter_uses_insert_preparation_and_callbacks(self):
+        calls = []
+        self.table._db._adapter.supports_atomic_upsert = True
+        self.table._db._adapter.upsert = (
+            lambda table, conflict_fields, fields: 17
+        )
+        self.table._before_insert.append(lambda row: calls.append(("before", row.name)))
+        self.table._after_insert.append(
+            lambda row, record_id: calls.append(("after", row.name, record_id))
+        )
+
+        record_id = self.table.upsert("name", name="alice")
+
+        self.assertEqual(record_id, 17)
+        self.assertEqual(calls, [("before", "alice"), ("after", "alice", 17)])
+
+
+class TestPostgresUpsertSQL(unittest.TestCase):
+    def setUp(self):
+        from pydal.backends.postgres import PostgresDialect
+
+        self.db = DAL("sqlite:memory", migrate=False)
+        self.db._adapter.dialect = PostgresDialect(self.db._adapter)
+        self.db.define_table(
+            "upsert_sql",
+            Field("tenant", rname='"tenant_key"'),
+            Field("name", default="anonymous"),
+            Field("score", "integer"),
+        )
+        self.table = self.db.upsert_sql
+
+    def tearDown(self):
+        self.db.close()
+
+    def _sql(self, conflict_fields, **values):
+        from pydal.backends.postgres import Postgres
+
+        row = self.table._fields_and_values_for_insert(values)
+        return Postgres._upsert(
+            self.db._adapter, self.table, conflict_fields, row.op_values()
+        )
+
+    def test_generates_on_conflict_update_and_returning(self):
+        sql = self._sql(
+            [self.table.tenant], tenant="acme", name="O'Brien", score=3
+        )
+        self.assertTrue(
+            sql.startswith('INSERT INTO "upsert_sql" AS "_pydal_upsert"(')
+        )
+        self.assertIn('"tenant_key"', sql)
+        self.assertIn('"name"', sql)
+        self.assertIn('"score"', sql)
+        self.assertIn(
+            'ON CONFLICT ("tenant_key") DO UPDATE SET ', sql
+        )
+        self.assertIn("'O''Brien'", sql)
+        self.assertIn('"name"=EXCLUDED."name"', sql)
+        self.assertIn('"score"=EXCLUDED."score"', sql)
+        self.assertTrue(sql.endswith('RETURNING "id";'))
+
+    def test_excludes_id_and_all_conflict_fields_from_update(self):
+        sql = self._sql(
+            [self.table.tenant, self.table.name],
+            id=99,
+            tenant="acme",
+            name="Alice",
+            score=3,
+        )
+        self.assertIn('ON CONFLICT ("tenant_key","name")', sql)
+        self.assertEqual(sql.count("EXCLUDED."), 1)
+        self.assertIn('SET "score"=EXCLUDED."score"', sql)
+
+    def test_uses_noop_update_when_only_conflict_fields_remain(self):
+        from pydal.backends.postgres import Postgres
+
+        sql = Postgres._upsert(
+            self.db._adapter,
+            self.table,
+            [self.table.tenant],
+            [(self.table.tenant, "acme")],
+        )
+        self.assertIn(
+            'DO UPDATE SET "tenant_key"="_pydal_upsert"."tenant_key"', sql
+        )
+        self.assertTrue(sql.endswith('RETURNING "id";'))
+
+
+@unittest.skipUnless(IS_POSTGRESQL, "PostgreSQL upsert integration tests")
+class TestPostgresUpsertLive(DALtest):
+    def test_unique_conflict_updates_and_returns_same_id(self):
+        calls = []
+        db = self.connect()
+        table = db.define_table(
+            "upsert_live_unique",
+            Field("email", unique=True),
+            Field("name"),
+            Field("ingest_source", default=lambda: "api"),
+            Field("label", compute=lambda row: "%s:%s" % (row.email, row.name)),
+        )
+        table._after_insert.append(
+            lambda row, record_id: calls.append((row.label, int(record_id)))
+        )
+
+        inserted_id = table.upsert("email", email="alice@example.com", name="Alice")
+        updated_id = table.upsert(
+            table.email, email="alice@example.com", name="Alicia"
+        )
+
+        self.assertEqual(int(inserted_id), int(updated_id))
+        row = db(table.email == "alice@example.com").select().first()
+        self.assertEqual(db(table).count(), 1)
+        self.assertEqual(row.name, "Alicia")
+        self.assertEqual(row.ingest_source, "api")
+        self.assertEqual(row.label, "alice@example.com:Alicia")
+        self.assertEqual(
+            calls,
+            [
+                ("alice@example.com:Alice", int(inserted_id)),
+                ("alice@example.com:Alicia", int(inserted_id)),
+            ],
+        )
+
+    def test_composite_unique_conflict(self):
+        db = self.connect()
+        table = db.define_table(
+            "upsert_live_composite",
+            Field("tenant"),
+            Field("external_key"),
+            Field("payload"),
+        )
+        db.executesql(
+            'ALTER TABLE "upsert_live_composite" '
+            'ADD CONSTRAINT "upsert_live_composite_key" '
+            'UNIQUE ("tenant", "external_key");'
+        )
+
+        inserted_id = table.upsert(
+            ["tenant", "external_key"],
+            tenant="acme",
+            external_key="42",
+            payload="first",
+        )
+        updated_id = table.upsert(
+            [table.tenant, table.external_key],
+            tenant="acme",
+            external_key="42",
+            payload="second",
+        )
+
+        self.assertEqual(int(inserted_id), int(updated_id))
+        self.assertEqual(db(table).count(), 1)
+        self.assertEqual(db(table).select().first().payload, "second")
+
+    def test_conflict_only_values_return_existing_id(self):
+        db = self.connect()
+        table = db.define_table(
+            "upsert_live_noop",
+            Field("external_key", unique=True),
+        )
+
+        inserted_id = table.upsert("external_key", external_key="same")
+        updated_id = table.upsert("external_key", external_key="same")
+
+        self.assertEqual(int(inserted_id), int(updated_id))
+        self.assertEqual(db(table).count(), 1)
+        self.assertEqual(db(table).select().first().external_key, "same")
+
+    def test_concurrent_connections_return_one_record(self):
+        import queue
+        import threading
+
+        db = self.connect()
+        table = db.define_table(
+            "upsert_live_concurrent",
+            Field("lookup_key", unique=True),
+            Field("payload"),
+        )
+        db.commit()
+        barrier = threading.Barrier(2)
+        outcomes = queue.Queue()
+
+        def worker(payload):
+            worker_db = DAL(DEFAULT_URI, check_reserved=["all"])
+            try:
+                worker_table = worker_db.define_table(
+                    "upsert_live_concurrent",
+                    Field("lookup_key", unique=True),
+                    Field("payload"),
+                    migrate=False,
+                )
+                worker_db.executesql("SET lock_timeout TO '5s';")
+                barrier.wait(timeout=10)
+                record_id = worker_table.upsert(
+                    "lookup_key", lookup_key="shared", payload=payload
+                )
+                worker_db.commit()
+                outcomes.put(("id", int(record_id)))
+            except Exception as error:
+                worker_db.rollback()
+                outcomes.put(("error", repr(error)))
+            finally:
+                worker_db.close()
+
+        threads = [
+            threading.Thread(target=worker, args=("first",)),
+            threading.Thread(target=worker, args=("second",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(15)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        results = [outcomes.get_nowait() for thread in threads]
+        errors = [value for kind, value in results if kind == "error"]
+        self.assertEqual(errors, [])
+        record_ids = [value for kind, value in results if kind == "id"]
+        self.assertEqual(len(record_ids), 2)
+        self.assertEqual(record_ids[0], record_ids[1])
+        self.assertEqual(db(table).count(), 1)
+
+
 class TestBulkInsert(DALtest):
     def testRun(self):
         db = self.connect()
