@@ -8,6 +8,7 @@ well-formed placeholders, captured values, and real database round-trips.
 """
 
 import datetime
+from base64 import b64encode
 
 from pydal import DAL, Field
 from pydal.ast_translate import (
@@ -112,7 +113,7 @@ class TestAstParamCompilation(unittest.TestCase):
         self.assertEqual(adapter._last_insert, (self.db.t.id, 1))
 
     def test_postgres_percent_values_and_complex_literals_are_safe(self):
-        compiler = PostgresPsycoCompiler(represent=self.db._adapter.represent)
+        compiler = PostgresPsycoCompiler(adapter=self.db._adapter)
         row = self.db.t._fields_and_values_for_insert(
             {
                 "name": "50% complete %s",
@@ -121,10 +122,10 @@ class TestAstParamCompilation(unittest.TestCase):
             }
         )
         sql = compiler.compile_insert(table_to_insert(self.db.t, row.op_values()))
-        self.assertEqual(sql.params, ("50% complete %s",))
-        self.assertEqual(sql.replace("%%", "").count("%s"), 1)
-        self.assertIn("100%%", sql)
-        self.assertIn("%%s", sql)
+        self.assertIn("50% complete %s", sql.params)
+        self.assertIn('{"progress": "100%", "token": "%s"}', sql.params)
+        self.assertIn("|20%|%s|", sql.params)
+        self.assertEqual(sql.replace("%%", "").count("%s"), 3)
 
     def test_postgres_typed_values_and_in_list_bind(self):
         compiler = PostgresPsycoCompiler(represent=self.db._adapter.represent)
@@ -240,6 +241,89 @@ class TestAstParamCompilation(unittest.TestCase):
         self.assertIsInstance(compiler, PostgresCompiler)
         self.assertNotIsInstance(compiler, PostgresPsycoCompiler)
         self.assertFalse(compiler.parameterize)
+
+    def test_postgres_complex_values_bind_in_existing_storage_formats(self):
+        from pydal.backends.postgres import PostgresDialectJSON
+
+        db = DAL("sqlite:memory", migrate=False)
+        try:
+            db._adapter.dialect = PostgresDialectJSON(db._adapter)
+            db.define_table(
+                "complex_value",
+                Field("payload", "json"),
+                Field("metadata", "jsonb"),
+                Field("tags", "list:string"),
+                Field("numbers", "list:integer"),
+                Field("content", "blob"),
+                Field("stored_name", "upload"),
+                Field("shape", "geometry(POINT,4326)"),
+                Field("location", "geography(POINT,4326)"),
+                migrate=False,
+            )
+            fields = [
+                (db.complex_value.payload, {"progress": "100%"}),
+                (db.complex_value.metadata, ["quoted' value", "%s"]),
+                (db.complex_value.tags, ["a|b", "c"]),
+                (db.complex_value.numbers, [1, 2]),
+                (db.complex_value.content, b"hello\x00world"),
+                (db.complex_value.stored_name, "stored/name.bin"),
+                (db.complex_value.shape, "POINT(1 2)"),
+                (db.complex_value.location, "POINT(3 4)"),
+            ]
+            compiler = PostgresPsycoCompiler(adapter=db._adapter)
+            sql = compiler.compile_insert(table_to_insert(db.complex_value, fields))
+
+            self.assertIn("%s::json", sql)
+            self.assertIn("%s::jsonb", sql)
+            self.assertIn("%s::text", sql)
+            self.assertIn("%s::bytea", sql)
+            self.assertIn("ST_GeomFromText(%s,4326)", sql)
+            self.assertIn("ST_GeogFromText(%s)", sql)
+            self.assertEqual(
+                sql.params,
+                (
+                    '{"progress": "100%"}',
+                    '["quoted\' value", "%s"]',
+                    "|a||b|c|",
+                    "|1|2|",
+                    b64encode(b"hello\x00world"),
+                    "stored/name.bin",
+                    "POINT(1 2)",
+                    "SRID=4326;POINT(3 4)",
+                ),
+            )
+        finally:
+            db.close()
+
+    def test_postgres_native_arrays_bind_as_typed_python_lists(self):
+        from pydal.backends.postgres import PostgresDialectArraysJSON
+
+        db = DAL("sqlite:memory", migrate=False)
+        try:
+            db._adapter.dialect = PostgresDialectArraysJSON(db._adapter)
+            db.define_table(
+                "native_array",
+                Field("tags", "list:string"),
+                Field("numbers", "list:integer"),
+                Field("owners", "list:reference native_array"),
+                migrate=False,
+            )
+            fields = [
+                (db.native_array.tags, ["a,b", "quoted' value"]),
+                (db.native_array.numbers, [1, 2]),
+                (db.native_array.owners, [3, 4]),
+            ]
+            compiler = PostgresPsycoCompiler(adapter=db._adapter)
+            sql = compiler.compile_insert(table_to_insert(db.native_array, fields))
+
+            self.assertIn("%s::text[]", sql)
+            self.assertEqual(sql.count("%s::bigint[]"), 2)
+            self.assertEqual(
+                sql.params,
+                (["a,b", "quoted' value"], [1, 2], [3, 4]),
+            )
+        finally:
+            db.close()
 
     def test_integer_value_binds(self):
         sql = self._select_p(self.db(self.db.t.age > 5), (self.db.t.id,))
