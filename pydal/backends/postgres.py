@@ -690,6 +690,13 @@ class PostgresDialectArrays(PostgresDialect):
                 "string" if first.type == "list:string" else "integer",
                 query_env=query_env,
             )
+            if case_sensitive and not isinstance(second, Expression):
+                array_type = "TEXT" if first.type == "list:string" else "BIGINT"
+                return "(%s @> ARRAY[%s]::%s[])" % (
+                    self.expand(first, query_env=query_env),
+                    f,
+                    array_type,
+                )
             s = self.any(first, query_env)
             if not case_sensitive and first.type == "list:string":
                 return self.ilike(f, s, escape="\\", query_env=query_env)

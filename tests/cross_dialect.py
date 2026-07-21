@@ -113,6 +113,83 @@ def _make_db_with_dialect(dialect_cls):
     return db
 
 
+@unittest.skipIf(IS_NOSQL, "SQL-only")
+class TestPostgresArrayContainsSQL(unittest.TestCase):
+    def setUp(self):
+        from pydal.backends.postgres import PostgresDialectArrays
+        from pydal.compilers import PostgresCompiler
+
+        self.db = DAL("sqlite:memory", migrate=False)
+        self.db._adapter.dialect = PostgresDialectArrays(self.db._adapter)
+        self.db._adapter.compiler = None
+        self.db.define_table("owner", Field("name"))
+        self.db.define_table(
+            "item",
+            Field("tags", "list:string"),
+            Field("numbers", "list:integer"),
+            Field("owners", "list:reference owner"),
+        )
+        self.compiler = PostgresCompiler(self.db._adapter, parameterize=False)
+
+    def tearDown(self):
+        self.db.close()
+
+    def assertBothPathsRender(self, expression, expected):
+        from pydal.ast_translate import to_ast
+
+        legacy = str(self.db._adapter.expand(expression))
+        compiled = self.compiler.compile_expression(to_ast(expression))
+        self.assertEqual(legacy, expected)
+        self.assertEqual(compiled, expected)
+
+    def test_case_sensitive_string_uses_typed_array_containment(self):
+        self.assertBothPathsRender(
+            self.db.item.tags.contains("O'Reilly", case_sensitive=True),
+            '("item"."tags" @> ARRAY[\'O\'\'Reilly\']::TEXT[])',
+        )
+
+    def test_case_sensitive_integer_and_reference_use_bigint_arrays(self):
+        self.assertBothPathsRender(
+            self.db.item.numbers.contains(42, case_sensitive=True),
+            '("item"."numbers" @> ARRAY[42]::BIGINT[])',
+        )
+        self.assertBothPathsRender(
+            self.db.item.owners.contains(7, case_sensitive=True),
+            '("item"."owners" @> ARRAY[7]::BIGINT[])',
+        )
+
+    def test_case_insensitive_string_keeps_any_ilike(self):
+        self.assertBothPathsRender(
+            self.db.item.tags.contains("Mixed", case_sensitive=False),
+            '(\'Mixed\' ILIKE ANY("item"."tags"))',
+        )
+
+    def test_expression_string_contains_casts_non_text_values(self):
+        self.db.define_table("typed_item", Field("tags", "list:string"), Field("number", "integer"))
+        expression = self.db.typed_item.tags.contains(
+            self.db.typed_item.number, case_sensitive=False
+        )
+        from pydal.ast_translate import to_ast
+
+        compiled = self.compiler.compile_expression(to_ast(expression))
+        self.assertEqual(
+            compiled,
+            '("typed_item"."number"::text ILIKE ANY("typed_item"."tags"))',
+        )
+
+    def test_serialized_postgres_lists_do_not_use_array_containment(self):
+        from pydal.ast_translate import to_ast
+        from pydal.backends.postgres import PostgresDialect
+        from pydal.compilers import PostgresCompiler
+
+        self.db._adapter.dialect = PostgresDialect(self.db._adapter)
+        compiler = PostgresCompiler(self.db._adapter, parameterize=False)
+        compiled = compiler.compile_expression(
+            to_ast(self.db.item.tags.contains("Mixed", case_sensitive=True))
+        )
+        self.assertNotIn(" @> ", compiled)
+
+
 @unittest.skipIf(IS_NOSQL, "SQL-only — verifies dialect retargeting")
 class TestCrossDialectSQLGeneration(unittest.TestCase):
     """

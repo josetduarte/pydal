@@ -387,6 +387,36 @@ rows = db(db.person.age >= 18).select(
 )
 ```
 
+### Keyset pagination
+
+For large ordered result sets, keep the last ordering values in your
+application and use them as the next page's predicate. Include a unique
+tie-breaker in both the index and `orderby` so rows with equal timestamps have
+a stable order:
+
+```python
+db.event.create_index(
+  "event_created_at_id", db.event.created_at, db.event.id
+)
+
+query = db.event.id != None
+if after_created_at is not None:
+  query &= (db.event.created_at > after_created_at) | (
+    (db.event.created_at == after_created_at) & (db.event.id > after_id)
+  )
+
+rows = db(query).select(
+  db.event.ALL,
+  orderby=db.event.created_at | db.event.id,
+  limitby=(0, page_size),
+)
+```
+
+`after_created_at` and `after_id` are values from the final row of the previous
+page, not a pyDAL pagination API. Avoid deep `limitby=(offset, end)` pages:
+database `OFFSET` generally scans and discards the preceding rows and can shift
+under concurrent inserts or deletes.
+
 ### Joins
 
 The simplest join is implicit — reference fields from two tables in the

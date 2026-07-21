@@ -1166,6 +1166,44 @@ class TestContains(DALtest):
         self.assertEqual(db(db.tt.aa.contains("perc%ent")).count(), 1)
         self.assertEqual(db(db.tt.aa.contains("under_score")).count(), 1)
 
+    @unittest.skipUnless(IS_POSTGRESQL, "native PostgreSQL arrays only")
+    def testPostgresNativeArrayScalarContains(self):
+        from pydal.backends.postgres import PostgresDialectArrays
+
+        db = self.connect()
+        if not isinstance(db._adapter.dialect, PostgresDialectArrays):
+            self.skipTest("requires postgres2 or postgres3")
+        db.define_table("array_owner", Field("name"))
+        db.define_table(
+            "array_item",
+            Field("tags", "list:string"),
+            Field("numbers", "list:integer"),
+            Field("owners", "list:reference array_owner"),
+        )
+        owner1 = db.array_owner.insert(name="first")
+        owner2 = db.array_owner.insert(name="second")
+        db.array_item.insert(
+            tags=["O'Reilly", "Mixed"], numbers=[42], owners=[owner1]
+        )
+        db.array_item.insert(tags=["other", "mixed"], numbers=[7], owners=[owner2])
+
+        self.assertEqual(
+            db(
+                db.array_item.tags.contains("O'Reilly", case_sensitive=True)
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            db(db.array_item.tags.contains("MIXED", case_sensitive=False)).count(),
+            2,
+        )
+        self.assertEqual(
+            db(db.array_item.numbers.contains(42, case_sensitive=True)).count(), 1
+        )
+        self.assertEqual(
+            db(db.array_item.owners.contains(owner1, case_sensitive=True)).count(), 1
+        )
+
 
 class TestLike(DALtest):
     def setUp(self):
