@@ -68,6 +68,26 @@ what (small) corners remain.
 - `SQLCompiler._render_like_left` hook extracted in the base so the
   Postgres override is a one-liner.
 
+### 7. PostgreSQL complex bound parameters — done
+
+- psycopg2 now binds `json`/`jsonb`, serialized and native `list:*`,
+  `blob`, `upload`, `geometry`, and `geography` values.
+- Existing storage contracts are preserved: base `postgres` list fields remain
+  pipe-delimited text, `postgres2`/`postgres3` use typed native arrays, blobs
+  remain base64 payloads in `BYTEA`, and spatial values use parameterized
+  PostGIS constructors with their configured SRID.
+- JDBC PostgreSQL remains inline because its placeholder contract is separate
+  from psycopg2's `%s` format.
+
+### 8. PostgreSQL AST fallback removal — done
+
+- psycopg2 PostgreSQL no longer silently falls back to the legacy statement
+  builders. Unsupported AST shapes now fail loudly.
+- The remaining exercised gaps are implemented: simultaneous inner/left joins,
+  multi-table counts, expression-based `contains`, regexp, PostgreSQL JSON and
+  spatial operators, CTE collector plumbing, and raw/custom select fields.
+- SQLite and non-PostgreSQL adapters retain their existing fallback policy.
+
 ---
 
 ## Remaining corners (low-priority)
@@ -78,17 +98,10 @@ These are real but cheap-to-leave-alone:
   both verified (PostgreSQL runs in CI). Running the suite against
   MySQL would confirm the remaining dialect-specific behavior and catch
   any bit-rotted overrides.
-- **Retire the legacy `_select_wcols` body.** Now that the AST path
-  covers every shape exercised by the test suite, the 200-line legacy
-  block in `adapters/base.py::_select_wcols` could shrink to just the
-  AST call. Risk: any production usage outside our test surface that
-  trips one of our `NotImplementedError`s still needs the fallback.
-  Worth a follow-up audit.
-- **Expand `_PARAMETERIZABLE_TYPES` further.** `list:*`, `json`,
-  `jsonb`, `blob`, `upload`, `geo*` all keep the inline path. Their
-  encodings are bespoke (pipe-delimited, JSON, base64, WKT/WKB) so
-  there's no security/perf win in binding them — same string would
-  flow through either way.
+- **Retire the legacy `_select_wcols` body globally.** psycopg2 PostgreSQL is
+  strict-AST now, but other SQL adapters retain the legacy block for production
+  shapes outside their test surfaces. Removing it globally needs equivalent
+  strict validation for each backend.
 - **NoSQL backends (`mongo`, `gae`, `couchdb`)** aren't wired through
   the AST. They have their own dialects/representers and the
   `_load_dependencies` compiler-lookup falls through to `None` for
@@ -118,5 +131,6 @@ These are real but cheap-to-leave-alone:
 | `outer_scoped` attr | ✅ AST |
 | Bound parameters: string/numeric/decimal | ✅ AST |
 | Bound parameters: date/time/datetime/boolean | ✅ AST |
-| `list:*`, `json`, `blob`, `geo*` literals | inline (deliberate) |
+| PostgreSQL `list:*`, `json`, `blob`, `upload`, `geo*` literals | ✅ bound (psycopg2) |
+| PostgreSQL statement fallback | disabled (psycopg2) |
 | NoSQL backends | legacy (out of scope) |

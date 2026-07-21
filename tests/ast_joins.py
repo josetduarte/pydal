@@ -124,13 +124,14 @@ class TestAstJoinsMatchesCurrentPath(unittest.TestCase):
 
 
 @unittest.skipIf(IS_NOSQL, "SQL-only")
-class TestAstJoinsUnsupported(unittest.TestCase):
+class TestAstJoinEdgeCases(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
         cls.db = DAL("sqlite:memory")
         cls.db.define_table("t1", Field("name"))
         cls.db.define_table("t2", Field("t1_id", "reference t1"))
+        cls.db.define_table("t3", Field("t1_id", "reference t1"))
 
     @classmethod
     def tearDownClass(cls):
@@ -162,13 +163,30 @@ class TestAstJoinsUnsupported(unittest.TestCase):
             if j.kind == "left":
                 self.assertIsNotNone(j.on)
 
-    def test_simultaneous_join_and_left_raises(self):
-        with self.assertRaises(NotImplementedError):
-            set_to_select(
-                self.db(self.db.t1.id > 0),
-                (self.db.t1.id,),
-                {
-                    "join": self.db.t2.on(self.db.t1.id == self.db.t2.t1_id),
-                    "left": self.db.t2.on(self.db.t1.id == self.db.t2.t1_id),
-                },
-            )
+    def test_simultaneous_join_and_left_are_preserved(self):
+        node = set_to_select(
+            self.db(self.db.t1.id > 0),
+            (self.db.t1.id,),
+            {
+                "join": self.db.t2.on(self.db.t1.id == self.db.t2.t1_id),
+                "left": self.db.t3.on(self.db.t1.id == self.db.t3.t1_id),
+            },
+        )
+        self.assertEqual([join.kind for join in node.joins], ["inner", "left"])
+
+    def test_simultaneous_join_and_left_return_expected_rows(self):
+        first = self.db.t1.insert(name="first")
+        second = self.db.t1.insert(name="second")
+        self.db.t2.insert(t1_id=first)
+        self.db.t2.insert(t1_id=second)
+        self.db.t3.insert(t1_id=first)
+
+        rows = self.db(self.db.t1.id > 0).select(
+            self.db.t1.name,
+            self.db.t3.id,
+            join=self.db.t2.on(self.db.t1.id == self.db.t2.t1_id),
+            left=self.db.t3.on(self.db.t1.id == self.db.t3.t1_id),
+            orderby=self.db.t1.id,
+        )
+        self.assertEqual([row.t1.name for row in rows], ["first", "second"])
+        self.assertEqual([row.t3.id for row in rows], [1, None])

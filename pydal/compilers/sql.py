@@ -81,10 +81,9 @@ class Ctx:
 
 # Field types eligible for parameter binding. For each, ``_adapt_for_bind``
 # below converts the Python value into the wire form (matching pydal's
-# representer output, sans the quoting). Types not listed here keep the
-# legacy inline path — list:*, json/jsonb, blob/upload, geo*, etc., have
-# bespoke encodings (pipe-delimiters, JSON serialization, base64) and
-# aren't worth the round-trip through bound params.
+# representer output, sans the quoting). Types not listed here keep the generic
+# inline path; backend compilers may bind more types while preserving their
+# backend-specific storage contracts.
 _PARAMETERIZABLE_TYPES = frozenset(
     {
         "string", "text", "password",
@@ -881,22 +880,30 @@ class SQLCompiler:
 
     def op_startswith(self, l, r, _):
         """Render ``(left LIKE 'pat%' ESCAPE '\\\\')``."""
-        if not isinstance(r, ast.Literal):
-            raise NotImplementedError("startswith on non-literal not supported")
-        pat = self._like_escape(str(r.value)) + "%"
+        if isinstance(r, ast.Literal):
+            pattern = ast.Literal(self._like_escape(str(r.value)) + "%", "string")
+        else:
+            pattern = ast.BinOp(
+                "add", r, ast.Literal("%", "string"),
+                opts=(("left_type", "string"),),
+            )
         return "(%s LIKE %s ESCAPE '\\')" % (
             self.visit(l),
-            self.visit(ast.Literal(pat, "string")),
+            self.visit(pattern),
         )
 
     def op_endswith(self, l, r, _):
         """Render ``(left LIKE '%pat' ESCAPE '\\\\')``."""
-        if not isinstance(r, ast.Literal):
-            raise NotImplementedError("endswith on non-literal not supported")
-        pat = "%" + self._like_escape(str(r.value))
+        if isinstance(r, ast.Literal):
+            pattern = ast.Literal("%" + self._like_escape(str(r.value)), "string")
+        else:
+            pattern = ast.BinOp(
+                "add", ast.Literal("%", "string"), r,
+                opts=(("left_type", "string"),),
+            )
         return "(%s LIKE %s ESCAPE '\\')" % (
             self.visit(l),
-            self.visit(ast.Literal(pat, "string")),
+            self.visit(pattern),
         )
 
     def op_contains(self, l, r, opts):
@@ -917,8 +924,37 @@ class SQLCompiler:
         elif isinstance(r, ast.Literal):
             pat = "%" + self._like_escape(str(r.value)) + "%"
         else:
-            raise NotImplementedError("contains on non-literal not supported")
-        new_r = ast.Literal(pat, "string")
+            value = ast.FuncCall("cast", (r,), opts=(("to", "TEXT"),))
+            if ltype and ltype.startswith("list:"):
+                value = ast.FuncCall(
+                    "replace",
+                    (
+                        ast.FuncCall(
+                            "replace",
+                            (value, ast.Literal("%", "string"), ast.Literal(r"\%", "string")),
+                        ),
+                        ast.Literal("|", "string"),
+                        ast.Literal("||", "string"),
+                    ),
+                )
+                prefix, suffix = "%|", "|%"
+            else:
+                value = ast.FuncCall(
+                    "replace",
+                    (value, ast.Literal("%", "string"), ast.Literal(r"\%", "string")),
+                )
+                prefix = suffix = "%"
+            new_r = ast.BinOp(
+                "add",
+                ast.BinOp(
+                    "add", ast.Literal(prefix, "string"), value,
+                    opts=(("left_type", "string"),),
+                ),
+                ast.Literal(suffix, "string"),
+                opts=(("left_type", "string"),),
+            )
+        if isinstance(r, ast.Literal):
+            new_r = ast.Literal(pat, "string")
         op = self.op_like if case_sensitive else self.op_ilike
         return op(l, new_r, {"escape": "\\"})
 

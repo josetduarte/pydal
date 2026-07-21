@@ -1,9 +1,8 @@
 """
-PostgresCompiler: Postgres-specific expression compilation.
+PostgreSQL expression compilation and psycopg2 parameter adaptation.
 
-Overrides LIKE/ILIKE rendering to cast non-text operands to ``::text``
-before comparison, since Postgres has no implicit integer→text coercion
-for the ``~~`` (LIKE) operator.
+Includes PostgreSQL JSON/GIS operators and bound representations for complex
+values such as JSON, arrays, binary data, and PostGIS geometry/geography.
 """
 
 from __future__ import annotations
@@ -43,6 +42,77 @@ class PostgresCompiler(SQLCompiler):
         if getattr(l, "type", None) not in _TEXT_TYPES:
             rendered = "%s::text" % rendered
         return ("LOWER(%s)" % rendered) if lowered_left else rendered
+
+    def op_regexp(self, l, r, _):
+        return "(%s ~ %s)" % (self.visit(l), self.visit(r))
+
+    def op_json_key(self, l, r, _):
+        return "%s->%s" % (self.visit(l), self.visit(r))
+
+    def op_json_key_value(self, l, r, _):
+        return "%s->>%s" % (self.visit(l), self.visit(r))
+
+    def op_json_path(self, l, r, _):
+        return "%s#>%s::text[]" % (self.visit(l), self.visit(r))
+
+    def op_json_path_value(self, l, r, _):
+        return "%s#>>%s::text[]" % (self.visit(l), self.visit(r))
+
+    def op_json_contains(self, l, r, _):
+        return "%s::jsonb@>%s::jsonb" % (self.visit(l), self.visit(r))
+
+    def un_st_astext(self, x, _):
+        return "ST_AsText(%s)" % self.visit(x)
+
+    def un_st_aswkb(self, x, _):
+        return self.visit(x)
+
+    def un_st_x(self, x, _):
+        return "ST_X(%s)" % self.visit(x)
+
+    def un_st_y(self, x, _):
+        return "ST_Y(%s)" % self.visit(x)
+
+    def _st_binary(self, name, l, r):
+        return "%s(%s,%s)" % (name, self.visit(l), self.visit(r))
+
+    def op_st_contains(self, l, r, _):
+        return self._st_binary("ST_Contains", l, r)
+
+    def op_st_distance(self, l, r, _):
+        return self._st_binary("ST_Distance", l, r)
+
+    def op_st_equals(self, l, r, _):
+        return self._st_binary("ST_Equals", l, r)
+
+    def op_st_intersects(self, l, r, _):
+        return self._st_binary("ST_Intersects", l, r)
+
+    def op_st_overlaps(self, l, r, _):
+        return self._st_binary("ST_Overlaps", l, r)
+
+    def op_st_simplify(self, l, r, _):
+        return self._st_binary("ST_Simplify", l, r)
+
+    def op_st_simplifypreservetopology(self, l, r, _):
+        return self._st_binary("ST_SimplifyPreserveTopology", l, r)
+
+    def op_st_touches(self, l, r, _):
+        return self._st_binary("ST_Touches", l, r)
+
+    def op_st_within(self, l, r, _):
+        return self._st_binary("ST_Within", l, r)
+
+    def op_st_transform(self, l, r, _):
+        return self._st_binary("ST_Transform", l, r)
+
+    def fn_st_dwithin(self, args, _):
+        return "ST_DWithin(%s,%s,%s)" % tuple(self.visit(arg) for arg in args)
+
+    def fn_st_asgeojson(self, args, opts):
+        return "ST_AsGeoJSON(%s,%s,%s)" % (
+            self.visit(args[0]), opts["precision"], opts["options"]
+        )
 
 
 @compilers.register_for(PostgresPsyco)
@@ -113,6 +183,27 @@ class PostgresPsycoCompiler(PostgresCompiler):
             return "ST_GeogFromText(%s)" % self._ctx.bind(value)
 
         return super().v_Literal(n)
+
+    def op_contains(self, l, r, opts):
+        ltype = opts.get("left_type") or self._left_type(l)
+        if not (
+            isinstance(getattr(self.adapter, "dialect", None), PostgresDialectArrays)
+            and ltype
+            and ltype.startswith("list:")
+        ):
+            return super().op_contains(l, r, opts)
+
+        value_type = "string" if ltype == "list:string" else "integer"
+        if isinstance(r, ast.Literal):
+            right = self.visit(ast.Literal(r.value, value_type))
+        else:
+            right = self.visit(r)
+            if ltype == "list:string":
+                right = "%s::text" % right
+        left = self.visit(l)
+        if not opts.get("case_sensitive", False) and ltype == "list:string":
+            return "(%s ILIKE ANY(%s))" % (right, left)
+        return "(%s = ANY(%s))" % (right, left)
 
 
 __all__ = ["PostgresCompiler", "PostgresPsycoCompiler"]

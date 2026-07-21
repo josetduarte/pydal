@@ -195,6 +195,7 @@ class PostgresPsyco(Postgres):
     """
 
     drivers = ("psycopg2",)
+    allow_ast_fallback = False
 
     def _config_json(self):
         use_json = (

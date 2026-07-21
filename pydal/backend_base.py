@@ -1069,6 +1069,7 @@ class SQLAdapter(BaseAdapter):
 
     commit_on_alter_table = False
     can_select_for_update = True
+    allow_ast_fallback = True
     execution_handlers = []
     migrator_cls = Migrator
 
@@ -1183,7 +1184,10 @@ class SQLAdapter(BaseAdapter):
                 from .ast_translate import table_to_insert
                 return self.compiler.compile_insert(table_to_insert(table, fields))
             except NotImplementedError:
-                pass
+                if not self.allow_ast_fallback:
+                    raise
+        elif not self.allow_ast_fallback:
+            raise RuntimeError("AST compiler is required for %s" % self.dbengine)
         if fields:
             return self.dialect.insert(
                 table._rname,
@@ -1224,7 +1228,10 @@ class SQLAdapter(BaseAdapter):
                 node = set_to_update(Set(self.db, query), fields)
                 return self.compiler.compile_update(node)
             except NotImplementedError:
-                pass
+                if not self.allow_ast_fallback:
+                    raise
+        elif not self.allow_ast_fallback:
+            raise RuntimeError("AST compiler is required for %s" % self.dbengine)
         sql_q = ""
         query_env = dict(current_scope=[table._tablename])
         if query:
@@ -1262,7 +1269,10 @@ class SQLAdapter(BaseAdapter):
                 node = set_to_delete(Set(self.db, query))
                 return self.compiler.compile_delete(node)
             except NotImplementedError:
-                pass
+                if not self.allow_ast_fallback:
+                    raise
+        elif not self.allow_ast_fallback:
+            raise RuntimeError("AST compiler is required for %s" % self.dbengine)
         sql_q = ""
         query_env = dict(current_scope=[table._tablename])
         if query:
@@ -1329,6 +1339,8 @@ class SQLAdapter(BaseAdapter):
         way; only SQL generation flips to the new path.
         """
         if self.compiler is None:
+            if not self.allow_ast_fallback:
+                raise RuntimeError("AST compiler is required for %s" % self.dbengine)
             return None
         try:
             from .objects import Set
@@ -1337,6 +1349,8 @@ class SQLAdapter(BaseAdapter):
             node = set_to_select(s, fields, attributes)
             sql = self.compiler.compile_select(node)
         except NotImplementedError:
+            if not self.allow_ast_fallback:
+                raise
             return None
         # Replicate _select_wcols' colnames-side computation: discover
         # the tablemap, apply common filters, expand fields, compute
@@ -1644,7 +1658,10 @@ class SQLAdapter(BaseAdapter):
                 node = set_to_count(Set(self.db, query), distinct=distinct)
                 return self.compiler.compile_count(node)
             except NotImplementedError:
-                pass
+                if not self.allow_ast_fallback:
+                    raise
+        elif not self.allow_ast_fallback:
+            raise RuntimeError("AST compiler is required for %s" % self.dbengine)
         tablemap = self.tables(query)
         tablenames = list(tablemap)
         tables = list(tablemap.values())

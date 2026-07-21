@@ -124,6 +124,9 @@ def _select_to_ast(sel: Select) -> ast.Node:
 
 def _field_type(node: Any) -> Optional[str]:
     """Best-effort field-type hint for a left operand."""
+    op_name = getattr(getattr(node, "op", None), "__name__", None)
+    if op_name in ("json_key_value", "json_path_value"):
+        return "string"
     t = getattr(node, "type", None)
     return t if isinstance(t, str) else None
 
@@ -141,8 +144,9 @@ def _expr_to_ast(expr) -> ast.Node:
 
     name = getattr(op, "__name__", None)
     if name is None:
-        # Defensive: unknown op shape. Preserve as opaque function call.
-        return ast.FuncCall(repr(op), _args_of(f, s))
+        return ast.Raw(str(expr))
+    if name == "<lambda>" and f is None and s is None:
+        return ast.Raw(str(op()))
 
     # ---------- logical ----------
     if name == "_and":
@@ -179,7 +183,7 @@ def _expr_to_ast(expr) -> ast.Node:
             if "match_parameter" in oa
             else ()
         )
-        return ast.BinOp("regexp", to_ast(f), to_ast(s), opts=opts)
+        return ast.BinOp("regexp", to_ast(f), to_ast(s, type_hint="string"), opts=opts)
     if name == "contains":
         opts2: ast.Opts = ()
         ftype = _field_type(f)
@@ -192,6 +196,34 @@ def _expr_to_ast(expr) -> ast.Node:
         if "case_sensitive" in oa:
             opts2 += (("case_sensitive", oa["case_sensitive"]),)
         return ast.BinOp("contains", to_ast(f), to_ast(s), opts=opts2)
+
+    if name in ("json_key", "json_key_value"):
+        key_type = "integer" if isinstance(s, int) else "string"
+        return ast.BinOp(name, to_ast(f), to_ast(s, type_hint=key_type))
+
+    if name in ("json_path", "json_path_value"):
+        return ast.BinOp(name, to_ast(f), to_ast(s, type_hint="string"))
+
+    if name == "json_contains":
+        return ast.BinOp(name, to_ast(f), to_ast(s, type_hint="string"))
+
+    if name in (
+        "st_contains",
+        "st_distance",
+        "st_equals",
+        "st_intersects",
+        "st_overlaps",
+        "st_touches",
+        "st_within",
+    ):
+        return ast.BinOp(name, to_ast(f), to_ast(s, type_hint=_field_type(f)))
+
+    if name in ("st_simplify", "st_simplifypreservetopology"):
+        return ast.BinOp(name, to_ast(f), to_ast(s, type_hint="double"))
+
+    if name == "st_transform":
+        target_type = "integer" if isinstance(s, int) else "string"
+        return ast.BinOp(name, to_ast(f), to_ast(s, type_hint=target_type))
 
     # ---------- belongs / IN ----------
     if name == "belongs":
@@ -289,11 +321,16 @@ def _expr_to_ast(expr) -> ast.Node:
         other, distance = s
         return ast.FuncCall(
             "st_dwithin",
-            (to_ast(f), to_ast(other), to_ast(distance, type_hint="double")),
+            (
+                to_ast(f),
+                to_ast(other, type_hint=_field_type(f)),
+                to_ast(distance, type_hint="double"),
+            ),
         )
 
-    # ---------- fallback: opaque function call ----------
-    return ast.FuncCall(name, _args_of(f, s))
+    # Custom dialect expressions remain an explicit raw-SQL escape hatch,
+    # but no longer force the containing statement back to the legacy path.
+    return ast.Raw(str(expr))
 
 
 def _args_of(f, s):
@@ -311,9 +348,6 @@ def _args_of(f, s):
 # application, and field expansion so we stay on the same plumbing as the
 # current path while the new pipeline is verified byte-for-byte against it.
 # ---------------------------------------------------------------------------
-
-
-_UNSUPPORTED_SELECT_ATTRS = ("with_cte", "cte_collector")
 
 
 def set_to_select(
@@ -336,30 +370,22 @@ def set_to_select(
     into ``with_cte``. The outermost translator extracts all CTEs; CTE
     bodies and recursive parts inherit them by name only.
 
-    Out of scope (raise NotImplementedError):
-      * bare tables in ``join=`` / ``left=`` (the rare/buggy weird forms)
-      * simultaneous ``join=`` and ``left=`` (uncommon)
+        Bare join tables and simultaneous ``join=`` / ``left=`` forms are
+        normalized into explicit AST Join nodes.
     """
     attrs = dict(attrs) if attrs else {}
     # ``correlated`` is a per-Select hint, not a SQL clause; pop it
     # before validation and apply at the end. Default True matches the
     # ast.Select default.
     correlated_flag = attrs.pop("correlated", True)
-    for unsupported in _UNSUPPORTED_SELECT_ATTRS:
-        if attrs.get(unsupported):
-            raise NotImplementedError(
-                "set_to_select: %r is not yet supported" % unsupported
-            )
+    attrs.pop("with_cte", None)
+    attrs.pop("cte_collector", None)
 
     db = s.db
     adapter = db._adapter
     query = s.query
     join_param = attrs.get("join")
     left_param = attrs.get("left")
-    if join_param and left_param:
-        raise NotImplementedError(
-            "set_to_select: simultaneous join= and left= not yet supported"
-        )
 
     # ---- 1) expand_all needs the WIDE tablemap (including joins) so
     # SQLALL placeholders can resolve. ----
@@ -455,6 +481,40 @@ def _build_from_clause(adapter, tablemap, query_tables, join_param, left_param):
     if not (join_param or left_param):
         sources = tuple(_table_to_ref(tablemap[t]) for t in query_tables)
         return sources, ()
+
+    if join_param and left_param:
+        (
+            ijoin_tables, ijoin_on, itables_to_merge, ijoin_on_tables,
+            _iimportant, _iexcluded, itablemap,
+        ) = adapter._build_joins_for_select(tablemap, join_param)
+        (
+            left_tables, left_on, left_to_merge, left_on_tables,
+            _limportant, _lexcluded, left_tablemap,
+        ) = adapter._build_joins_for_select(tablemap, left_param)
+        tablemap = merge_tablemaps(
+            tablemap, itables_to_merge, itablemap, left_to_merge, left_tablemap
+        )
+        joined = set(ijoin_on_tables + left_on_tables)
+        anchors = []
+        for name in query_tables + list(itables_to_merge) + list(left_to_merge):
+            if name not in joined and name not in anchors:
+                anchors.append(name)
+        if not anchors:
+            raise SyntaxError("Set: join=/left= without an anchor table")
+        sources = (_table_to_ref(tablemap[anchors[0]]),)
+        joins = [
+            ast.Join("cross", _table_to_ref(tablemap[name]), None)
+            for name in anchors[1:]
+        ]
+        for name in ijoin_tables:
+            joins.append(ast.Join("cross", _table_to_ref(itablemap[name]), None))
+        joins.extend(_join_from_on("inner", expr, adapter) for expr in ijoin_on)
+        for name in left_tables:
+            joins.append(
+                ast.Join("left", _table_to_ref(left_tablemap[name]), ast.Literal(True))
+            )
+        joins.extend(_join_from_on("left", expr, adapter) for expr in left_on)
+        return sources, tuple(joins)
 
     if join_param:
         (
@@ -610,15 +670,9 @@ def set_to_count(s, distinct=None) -> ast.Count:
     if use_common_filters(query):
         query = adapter.common_filter(query, tables)
 
-    if len(tablemap) != 1:
-        raise NotImplementedError(
-            "set_to_count: multi-table count lands in the next sub-layer"
-        )
-    table_node = _table_to_ref(tables[0])
-
     inner = ast.Select(
         fields=(ast.Star(),),
-        sources=(table_node,),
+        sources=tuple(_table_to_ref(table) for table in tables),
         where=to_ast(query) if query else None,
     )
 

@@ -242,6 +242,12 @@ class TestAstParamCompilation(unittest.TestCase):
         self.assertNotIsInstance(compiler, PostgresPsycoCompiler)
         self.assertFalse(compiler.parameterize)
 
+    def test_only_psycopg2_disables_ast_fallback(self):
+        from pydal.backends.postgres import JDBCPostgres, PostgresPsyco
+
+        self.assertFalse(PostgresPsyco.allow_ast_fallback)
+        self.assertTrue(JDBCPostgres.allow_ast_fallback)
+
     def test_postgres_complex_values_bind_in_existing_storage_formats(self):
         from pydal.backends.postgres import PostgresDialectJSON
 
@@ -610,6 +616,8 @@ class TestPostgresParamExecution(unittest.TestCase):
             Field("created", "datetime"),
             Field("payload", "json"),
             Field("tags", "list:string"),
+            Field("content", "blob"),
+            Field("stored_name", "upload"),
             migrate=False,
         )
         ddl = self.db._adapter.migrator.create_table(self.table, migrate=False)
@@ -642,6 +650,8 @@ class TestPostgresParamExecution(unittest.TestCase):
             created=datetime.datetime(2024, 1, 15, 12, 30, 45),
             payload={"progress": "100%", "token": "%s"},
             tags=["20%", "%s", "comma, value"],
+            content=b"binary\x00payload",
+            stored_name="stored/name.bin",
         )
 
     def test_crud_and_returning_round_trip(self):
@@ -685,20 +695,32 @@ class TestPostgresParamExecution(unittest.TestCase):
         )
 
     def test_typed_json_and_array_values_round_trip(self):
+        from pydal.backends.postgres import PostgresDialectArrays
+
         self._insert()
         row = self.db(self.table.active == True).select().first()  # noqa: E712
         self.assertEqual(row.born, datetime.date(2024, 1, 15))
         self.assertEqual(row.created, datetime.datetime(2024, 1, 15, 12, 30, 45))
         self.assertEqual(row.payload, {"progress": "100%", "token": "%s"})
         self.assertEqual(row.tags, ["20%", "%s", "comma, value"])
+        self.assertEqual(row.content, "binary\x00payload")
+        self.assertEqual(row.stored_name, "stored/name.bin")
         insert_sql, insert_params = next(
             (command, params)
             for command, params in self.commands
             if command.startswith("INSERT INTO ")
         )
-        self.assertNotIn(self.table.payload.name, insert_params)
-        self.assertIn("100%%", insert_sql)
-        self.assertIn("%%s", insert_sql)
+        self.assertIn('{"progress": "100%", "token": "%s"}', insert_params)
+        if isinstance(self.db._adapter.dialect, PostgresDialectArrays):
+            self.assertIn(["20%", "%s", "comma, value"], insert_params)
+            self.assertIn("%s::text[]", insert_sql)
+        else:
+            self.assertIn("|20%|%s|comma, value|", insert_params)
+            self.assertIn("%s::text", insert_sql)
+        self.assertIn(b64encode(b"binary\x00payload"), insert_params)
+        self.assertIn("stored/name.bin", insert_params)
+        self.assertIn("%s::json", insert_sql)
+        self.assertIn("%s::bytea", insert_sql)
 
     def test_value_varied_queries_reuse_command_text(self):
         self._insert(name="alice", age=20)
@@ -715,3 +737,114 @@ class TestPostgresParamExecution(unittest.TestCase):
         self.assertEqual(counts[0][0], counts[1][0])
         self.assertEqual(counts[0][1], ("alice",))
         self.assertEqual(counts[1][1], ("bob",))
+
+
+@unittest.skipUnless(IS_POSTGRESQL, "live PostgreSQL only")
+class TestPostgresNativeArrayParamExecution(unittest.TestCase):
+    def test_native_arrays_round_trip_as_bound_lists(self):
+        from pydal.backends.postgres import PostgresDialectArrays
+
+        db = DAL(DEFAULT_URI, migrate=False)
+        try:
+            if not isinstance(db._adapter.dialect, PostgresDialectArrays):
+                self.skipTest("requires postgres2 or postgres3")
+            db.executesql('DROP TABLE IF EXISTS "pydal_bound_arrays";')
+            db.commit()
+            table = db.define_table(
+                "pydal_bound_arrays",
+                Field("tags", "list:string"),
+                Field("numbers", "list:integer"),
+                Field("owners", "list:reference pydal_bound_arrays"),
+                migrate=False,
+            )
+            ddl = db._adapter.migrator.create_table(table, migrate=False)
+            db._adapter.create_sequence_and_triggers(ddl, table)
+            db.commit()
+
+            commands = []
+            execute = db._adapter.driver_io.execute
+            db._adapter.driver_io.execute = lambda sql, *args, **kwargs: (
+                commands.append((str(sql), getattr(sql, "params", None))),
+                execute(sql, *args, **kwargs),
+            )[1]
+            row_id = table.insert(
+                tags=["comma, value", "quoted' value"],
+                numbers=[1, 2],
+                owners=[],
+            )
+            row = db(table.id == row_id).select().first()
+            self.assertEqual(row.tags, ["comma, value", "quoted' value"])
+            self.assertEqual(row.numbers, [1, 2])
+            self.assertEqual(row.owners, [])
+            insert_sql, params = next(
+                item for item in commands if item[0].startswith("INSERT INTO ")
+            )
+            self.assertIn("%s::text[]", insert_sql)
+            self.assertEqual(insert_sql.count("%s::bigint[]"), 2)
+            self.assertIn(["comma, value", "quoted' value"], params)
+            self.assertIn([1, 2], params)
+        finally:
+            db._adapter.driver_io.execute = locals().get("execute", db._adapter.driver_io.execute)
+            db.rollback()
+            db.executesql('DROP TABLE IF EXISTS "pydal_bound_arrays";')
+            db.commit()
+            db.close()
+
+
+@unittest.skipUnless(IS_POSTGRESQL, "live PostgreSQL only")
+class TestPostgresSpatialParamExecution(unittest.TestCase):
+    def test_geometry_and_geography_values_bind(self):
+        db = DAL(DEFAULT_URI, migrate=False)
+        try:
+            try:
+                db.executesql("SELECT PostGIS_Version();")
+            except Exception:
+                db.rollback()
+                self.skipTest("PostGIS extension is not available")
+            db.executesql('DROP TABLE IF EXISTS "pydal_bound_spatial";')
+            db.commit()
+            table = db.define_table(
+                "pydal_bound_spatial",
+                Field("shape", "geometry(POINT,4326)"),
+                Field("location", "geography(POINT,4326)"),
+                migrate=False,
+            )
+            db.executesql(
+                'CREATE TABLE "pydal_bound_spatial" ('
+                '"id" SERIAL PRIMARY KEY, '
+                '"shape" geometry(POINT,4326), '
+                '"location" geography(POINT,4326));'
+            )
+            db.commit()
+
+            commands = []
+            execute = db._adapter.driver_io.execute
+            db._adapter.driver_io.execute = lambda sql, *args, **kwargs: (
+                commands.append((str(sql), getattr(sql, "params", None))),
+                execute(sql, *args, **kwargs),
+            )[1]
+            row_id = table.insert(
+                shape="POINT(1 2)",
+                location="POINT(3 4)",
+            )
+            shape = db(table.id == row_id).select(
+                table.shape.st_astext().with_alias("shape")
+            ).first().shape
+            self.assertEqual(shape, "POINT(1 2)")
+            self.assertEqual(
+                db(table.shape.st_dwithin("POINT(1 2)", 0.1)).count(),
+                1,
+            )
+            insert_sql, params = next(
+                item for item in commands if item[0].startswith("INSERT INTO ")
+            )
+            self.assertIn("ST_GeomFromText(%s,4326)", insert_sql)
+            self.assertIn("ST_GeogFromText(%s)", insert_sql)
+            self.assertIn("POINT(1 2)", params)
+            self.assertIn("SRID=4326;POINT(3 4)", params)
+        finally:
+            db._adapter.driver_io.execute = locals().get("execute", db._adapter.driver_io.execute)
+            db.rollback()
+            db.executesql('DROP TABLE IF EXISTS "pydal_bound_spatial";')
+            db.commit()
+            db.close()
