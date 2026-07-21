@@ -845,7 +845,7 @@ class BaseAdapter(ConnectionPool, metaclass=AdapterMeta):
 
     def parse_value(self, value, field_itype, field_type, blob_decode=True):
         # [Note - gi0baro] I think next if block can be (should be?) avoided
-        if field_type != "blob" and isinstance(value, str):
+        if field_type != "blob" and isinstance(value, bytes):
             try:
                 value = value.decode(self.db._db_codec)
             except Exception:

@@ -109,6 +109,29 @@ class TestUnicode(unittest.TestCase):
         db.close()
 
 
+class TestParseValue(unittest.TestCase):
+    def test_bytes_are_decoded_with_database_codec(self):
+        db = DAL(DEFAULT_URI, db_codec="latin-1")
+        value = db._adapter.parse_value(b"caf\xe9", None, None)
+        self.assertEqual(value, "caf\xe9")
+        db.close()
+
+    def test_str_is_not_decoded(self):
+        class DecodeSentinel(str):
+            decode_calls = 0
+
+            def decode(self, encoding):
+                self.decode_calls += 1
+                return self
+
+        db = DAL(DEFAULT_URI)
+        value = DecodeSentinel("already decoded")
+        parsed = db._adapter.parse_value(value, None, None)
+        self.assertIs(parsed, value)
+        self.assertEqual(value.decode_calls, 0)
+        db.close()
+
+
 class TestParseDateTime(unittest.TestCase):
     def testRun(self):
         db = DAL(DEFAULT_URI, check_reserved=["all"])
