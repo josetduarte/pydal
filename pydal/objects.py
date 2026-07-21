@@ -4108,27 +4108,49 @@ class IterRows(BasicRows):
         self.last_item_id = None
         self.compact = True
         self.sql = sql
-        # get a new cursor in order to be able to iterate without undesired behavior
-        # not completely safe but better than before
-        self.cursor = self.db._adapter.cursor
-        self.db._adapter.execute(sql)
-        # give the adapter a new cursor since this one is busy
-        self.db._adapter.reset_cursor()
+        self._closed = False
+        self.cursor = self.db._adapter._iterselect_cursor(sql)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self.cursor.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+    def _fetchone(self):
+        try:
+            return self.db._adapter._iterselect_fetchone(self.cursor)
+        except Exception:
+            self.close()
+            raise
 
     def __next__(self):
-        db_row = self.cursor.fetchone()
-        if db_row is None:
+        if self._closed:
             raise StopIteration
-        row = self.db._adapter._parse(
-            db_row,
-            self.tmps,
-            self.fields,
-            self.colnames,
-            self.blob_decode,
-            self.cacheable,
-            self.fields_virtual,
-            self.fields_lazy,
-        )
+        db_row = self._fetchone()
+        if db_row is None:
+            self.close()
+            raise StopIteration
+        try:
+            row = self.db._adapter._parse(
+                db_row,
+                self.tmps,
+                self.fields,
+                self.colnames,
+                self.blob_decode,
+                self.cacheable,
+                self.fields_virtual,
+                self.fields_lazy,
+            )
+        except Exception:
+            self.close()
+            raise
         if self.compact:
             # The following is to translate
             # <Row {'t0': {'id': 1L, 'name': 'web2py'}}>
@@ -4141,6 +4163,8 @@ class IterRows(BasicRows):
         return row
 
     def __iter__(self):
+        if self._closed:
+            return
         if self._head:
             yield self._head
         try:
@@ -4177,14 +4201,16 @@ class IterRows(BasicRows):
 
         # fetch and drop the first key - 1 elements
         for i in range(n_to_drop):
-            self.cursor.fetchone()
-        row = next(self)
-        if row is None:
+            if self._closed or self._fetchone() is None:
+                self.close()
+                raise IndexError
+        try:
+            row = next(self)
+        except StopIteration:
             raise IndexError
-        else:
-            self.last_item_id = key
-            self.last_item = row
-            return row
+        self.last_item_id = key
+        self.last_item = row
+        return row
 
 
 #    # rowcount it doesn't seem to be reliable on all drivers

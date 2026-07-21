@@ -6,6 +6,7 @@
 
 import os.path
 import re
+import uuid
 
 from .._globals import IDENTITY, THREAD_LOCAL
 from ..drivers import psycopg2_adapt
@@ -204,6 +205,35 @@ class PostgresPsyco(Postgres):
     """
 
     drivers = ("psycopg2",)
+    ITERSELECT_FETCH_SIZE = 2000
+
+    def _iterselect_cursor(self, sql):
+        fetch_size = self.adapter_args.get(
+            "iterselect_fetch_size", self.ITERSELECT_FETCH_SIZE
+        )
+        if (
+            isinstance(fetch_size, bool)
+            or not isinstance(fetch_size, int)
+            or fetch_size <= 0
+        ):
+            raise ValueError("iterselect_fetch_size must be a positive integer")
+        cursor = self.connection.cursor(
+            name="pydal_iterselect_%s" % uuid.uuid4().hex,
+            withhold=True,
+        )
+        cursor.itersize = fetch_size
+        try:
+            self.driver_io.execute_on_cursor(cursor, sql)
+        except Exception:
+            cursor.close()
+            raise
+        return cursor
+
+    def _iterselect_fetchone(self, cursor):
+        try:
+            return next(cursor)
+        except StopIteration:
+            return None
 
     def _config_json(self):
         use_json = (

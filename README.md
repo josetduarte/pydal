@@ -258,7 +258,17 @@ rows.as_list()        # [{name: …}, …]
 ```
 
 For large result sets, use `iterselect()` instead — it returns rows
-one at a time without loading them all into memory.
+one at a time without loading them all into memory. With PostgreSQL and
+psycopg2, it uses a holdable server-side cursor so iteration can continue
+across commits. The server fetch batch defaults to 2000 rows and can be set
+to any positive integer when creating the DAL:
+
+```python
+db = DAL(uri, adapter_args={"iterselect_fetch_size": 500})
+```
+
+Exhausting an `iterselect()` closes its cursor. When stopping early, call
+`rows.close()` or use `with db(query).iterselect() as rows:`.
 
 ### `Row` — a single record
 

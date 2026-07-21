@@ -47,6 +47,10 @@ class Driver:
 
         Returns whatever the DB-API cursor returns (typically ``None``).
         """
+        return self.execute_on_cursor(self._adapter.cursor, sql, *rest, **kwargs)
+
+    def execute_on_cursor(self, cursor, sql, *rest, **kwargs):
+        """Run a SQL statement through a specific DB-API cursor."""
         adapter = self._adapter
         command = adapter.filter_sql_command(sql)
         if not rest:
@@ -56,7 +60,7 @@ class Driver:
         handlers = adapter._build_handlers_for_execution()
         for h in handlers:
             h.before_execute(command)
-        rv = adapter.cursor.execute(command, *rest, **kwargs)
+        rv = cursor.execute(command, *rest, **kwargs)
         for h in handlers:
             h.after_execute(command)
         return rv

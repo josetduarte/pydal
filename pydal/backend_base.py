@@ -1019,6 +1019,15 @@ class BaseAdapter(ConnectionPool, metaclass=AdapterMeta):
         """
         return IterRows(self.db, sql, fields, colnames, blob_decode, cacheable)
 
+    def _iterselect_cursor(self, sql):
+        cursor = self.cursor
+        self.execute(sql)
+        self.reset_cursor()
+        return cursor
+
+    def _iterselect_fetchone(self, cursor):
+        return cursor.fetchone()
+
     def adapt(self, value):
         return value
 

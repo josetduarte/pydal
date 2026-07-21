@@ -3839,6 +3839,82 @@ class TestIterselect(DALtest):
 
         db._adapter.test_connection()
 
+    @unittest.skipUnless(IS_POSTGRESQL, "PostgreSQL only")
+    def testPostgresServerCursorConfiguration(self):
+        db = self.connect(adapter_args={"iterselect_fetch_size": 2})
+        if db._adapter.driver_name != "psycopg2":
+            self.skipTest("psycopg2 only")
+        t0 = db.define_table("t0", Field("name"))
+        names = ["one", "two", "three"]
+        for name in names:
+            t0.insert(name=name)
+
+        first = db(db.t0).iterselect(orderby=db.t0.id)
+        second = db(db.t0).iterselect(orderby=db.t0.id)
+        first_cursor = first.cursor
+        second_cursor = second.cursor
+
+        self.assertTrue(first_cursor.name)
+        self.assertNotEqual(first_cursor.name, second_cursor.name)
+        self.assertEqual(first_cursor.itersize, 2)
+        self.assertTrue(first_cursor.withhold)
+        self.assertIsNot(first_cursor, db._adapter.cursor)
+        self.assertEqual([row.name for row in first], names)
+        self.assertTrue(first_cursor.closed)
+        with second:
+            self.assertEqual(next(second).name, names[0])
+        self.assertTrue(second_cursor.closed)
+
+    @unittest.skipUnless(IS_POSTGRESQL, "PostgreSQL only")
+    def testPostgresNestedServerCursorUpdate(self):
+        db = self.connect(adapter_args={"iterselect_fetch_size": 2})
+        if db._adapter.driver_name != "psycopg2":
+            self.skipTest("psycopg2 only")
+        t0 = db.define_table("t0", Field("name"), Field("name_copy"))
+        names = ["one", "two", "three"]
+        for name in names:
+            t0.insert(name=name)
+        db.commit()
+
+        outer_rows = db(db.t0).iterselect(orderby=db.t0.id)
+        outer_cursor = outer_rows.cursor
+        updates = 0
+        for outer in outer_rows:
+            inner_rows = db(db.t0).iterselect(orderby=db.t0.id)
+            self.assertNotEqual(outer_cursor.name, inner_rows.cursor.name)
+            for inner in inner_rows:
+                if outer.id == inner.id:
+                    db(db.t0.id == outer.id).update(name_copy=outer.name)
+                    updates += 1
+
+        self.assertEqual(updates, len(names))
+        self.assertTrue(outer_cursor.closed)
+        copies = db(db.t0).select(db.t0.name_copy, orderby=db.t0.id)
+        self.assertEqual([row.name_copy for row in copies], names)
+
+    @unittest.skipUnless(IS_POSTGRESQL, "PostgreSQL only")
+    def testPostgresServerCursorSurvivesCommit(self):
+        db = self.connect(adapter_args={"iterselect_fetch_size": 2})
+        if db._adapter.driver_name != "psycopg2":
+            self.skipTest("psycopg2 only")
+        t0 = db.define_table("t0", Field("nn", "integer"))
+        for number in range(5):
+            t0.insert(nn=number)
+        db.commit()
+
+        rows = db(db.t0).iterselect(orderby=db.t0.id)
+        cursor = rows.cursor
+        seen = []
+        for row in rows:
+            seen.append(row.nn)
+            db(db.t0.id == row.id).update(nn=row.nn + 10)
+            db.commit()
+
+        self.assertEqual(seen, list(range(5)))
+        self.assertTrue(cursor.closed)
+        values = db(db.t0).select(db.t0.nn, orderby=db.t0.id)
+        self.assertEqual([row.nn for row in values], list(range(10, 15)))
+
 
 if __name__ == "__main__":
     unittest.main()
