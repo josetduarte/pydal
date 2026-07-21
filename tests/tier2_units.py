@@ -10,13 +10,16 @@ have dedicated tests.
 * ``pydal._load`` (OrderedDict / portalocker imports)
 * ``pydal.utils`` (utcnow / deprecated / split_uri_args)
 * ``pydal.drivers`` (DRIVERS dict + sentinel attrs)
+* ``pydal.connection.ConnectionPool``
 * ``pydal.helpers._internals.Dispatcher``
 """
 
 import datetime
+import threading
 import warnings
 
 from pydal import _globals, _load, drivers, exceptions, utils
+from pydal.connection import ConnectionPool
 from pydal.helpers._internals import Dispatcher
 
 from ._compat import unittest
@@ -165,6 +168,116 @@ class TestDrivers(unittest.TestCase):
                 "drivers.%s is unbound" % name,
             )
         self.assertIsInstance(drivers.is_jdbc, bool)
+
+
+class TestConnectionPool(unittest.TestCase):
+
+    def test_rejected_pooled_connection_is_closed_and_unbound(self):
+        class Cursor:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class Connection:
+            def __init__(self, broken=False):
+                self.broken = broken
+                self.closed = False
+                self.cursor_instance = Cursor()
+
+            def cursor(self):
+                return self.cursor_instance
+
+            def close(self):
+                self.closed = True
+
+        class Pool(ConnectionPool):
+            pool_size = 2
+
+            def connector(self):
+                raise AssertionError("pooled connection was not reused")
+
+            def test_connection(self):
+                if self.connection.broken:
+                    raise RuntimeError("broken connection")
+
+        pool = Pool()
+        pool.uri = "pool-rejection-test-%s" % id(self)
+        good = Connection()
+        broken = Connection(broken=True)
+        ConnectionPool.POOLS[pool.uri] = [good, broken]
+        try:
+            connection = pool.get_connection()
+            self.assertIs(connection, good)
+            self.assertIs(pool.connection, good)
+            self.assertIs(pool.cursor, good.cursor_instance)
+            self.assertTrue(broken.cursor_instance.closed)
+            self.assertTrue(broken.closed)
+        finally:
+            pool.set_connection(None)
+            ConnectionPool.POOLS.pop(pool.uri, None)
+
+    def test_concurrent_checkouts_validate_outside_global_lock(self):
+        state_lock = threading.Lock()
+        validation_barrier = threading.Barrier(2, timeout=5)
+        active_validations = [0]
+        max_active_validations = [0]
+        errors = []
+        uri = "pool-lock-test-%s" % id(self)
+
+        class Cursor:
+            def close(self):
+                pass
+
+        class Connection:
+            def cursor(self):
+                return Cursor()
+
+            def close(self):
+                pass
+
+        class Pool(ConnectionPool):
+            pool_size = 2
+
+            def connector(self):
+                raise AssertionError("pooled connection was not reused")
+
+            def test_connection(self):
+                with state_lock:
+                    active_validations[0] += 1
+                    max_active_validations[0] = max(
+                        max_active_validations[0], active_validations[0]
+                    )
+                try:
+                    validation_barrier.wait()
+                finally:
+                    with state_lock:
+                        active_validations[0] -= 1
+
+        pool = Pool()
+        pool.uri = uri
+        ConnectionPool.POOLS[uri] = [Connection(), Connection()]
+
+        def checkout():
+            try:
+                pool.get_connection()
+            except Exception as error:
+                with state_lock:
+                    errors.append(error)
+
+        threads = [threading.Thread(target=checkout) for _ in range(2)]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        finally:
+            ConnectionPool.POOLS.pop(uri, None)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(max_active_validations[0], 2)
 
 
 class TestDispatcher(unittest.TestCase):

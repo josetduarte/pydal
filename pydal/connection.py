@@ -86,19 +86,32 @@ class ConnectionPool:
 
         # Try the pool.
         if use_pool and self.pool_size:
-            try:
-                GLOBAL_LOCKER.acquire()
-                pool = ConnectionPool.POOLS.get(self.uri, [])
-                ConnectionPool.POOLS[self.uri] = pool
-                # Pop until we find a usable connection (or exhaust pool).
-                while connection is None and pool:
-                    connection = pool.pop()
+            while connection is None:
+                try:
+                    GLOBAL_LOCKER.acquire()
+                    pool = ConnectionPool.POOLS.get(self.uri, [])
+                    ConnectionPool.POOLS[self.uri] = pool
+                    if pool:
+                        connection = pool.pop()
+                finally:
+                    GLOBAL_LOCKER.release()
+                if connection is None:
+                    break
+                try:
+                    self.set_connection(connection, run_hooks=False)
+                except Exception:
                     try:
-                        self.set_connection(connection, run_hooks=False)
+                        cursor = getattr(THREAD_LOCAL, self._cursors_uname_, None)
+                        if cursor is not None:
+                            cursor.close()
                     except Exception:
-                        connection = None
-            finally:
-                GLOBAL_LOCKER.release()
+                        pass
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                    self.set_connection(None)
+                    connection = None
 
         # Still nothing — open fresh and run hooks.
         if connection is None:
