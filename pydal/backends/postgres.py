@@ -179,6 +179,39 @@ class Postgres(SQLAdapter, metaclass=PostgresMeta):
             )
         return self.dialect.insert_empty(table._rname)
 
+    def create_index(self, table, index_name, *fields, **kwargs):
+        concurrently = kwargs.get("concurrently", False)
+        if not concurrently:
+            return super(Postgres, self).create_index(
+                table, index_name, *fields, **kwargs
+            )
+        if not isinstance(concurrently, bool):
+            raise ValueError("Invalid concurrently: %r" % concurrently)
+        if self.driver_name != "psycopg2":
+            raise RuntimeError(
+                "concurrently=True is only supported by the psycopg2 adapter"
+            )
+
+        connection = self.connection
+        connection = getattr(connection, "__wrapped__", connection)
+        if (
+            connection.get_transaction_status()
+            != self.driver.extensions.TRANSACTION_STATUS_IDLE
+        ):
+            raise RuntimeError(
+                "concurrently=True requires an idle PostgreSQL connection"
+            )
+
+        previous_autocommit = connection.autocommit
+        try:
+            connection.autocommit = True
+            return super(Postgres, self).create_index(
+                table, index_name, *fields, **kwargs
+            )
+        finally:
+            if not connection.closed:
+                connection.autocommit = previous_autocommit
+
     @with_connection
     def prepare(self, key):
         self.execute("PREPARE TRANSACTION '%s';" % key)
@@ -317,7 +350,7 @@ class JDBCPostgres(Postgres):
 # ============================================================
 
 from ..helpers.methods import varquote_aux
-from ..objects import Expression
+from ..objects import Expression, Field
 from ..backend_base import dialects, register_expression, sqltype_for
 from ..backend_base import SQLDialect
 
@@ -461,17 +494,117 @@ class PostgresDialect(SQLDialect):
             raise ValueError("Invalid mode: %s" % mode)
         return ["DROP TABLE " + table._rname + " " + mode + ";"]
 
-    def create_index(self, name, table, expressions, unique=False, where=None):
+    def create_index(
+        self,
+        name,
+        table,
+        expressions,
+        unique=False,
+        where=None,
+        using=None,
+        opclasses=None,
+        include=None,
+        if_not_exists=False,
+        concurrently=False,
+    ):
+        def index_identifier(value, option, qualified=False):
+            if not isinstance(value, str) or not value:
+                raise ValueError("Invalid %s: %r" % (option, value))
+            parts = value.split(".")
+            if not qualified and len(parts) != 1:
+                raise ValueError("Invalid %s: %s" % (option, value))
+            valid_first = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+            valid_rest = valid_first + "0123456789$"
+            if any(
+                not part
+                or part[0] not in valid_first
+                or any(character not in valid_rest for character in part[1:])
+                for part in parts
+            ):
+                raise ValueError("Invalid %s: %s" % (option, value))
+            return value
+
+        if self.quote_template == "%s":
+            index_identifier(name, "index name")
+        elif not isinstance(name, str) or not name or '"' in name or "\x00" in name:
+            raise ValueError("Invalid index name: %r" % name)
+
+        if not isinstance(if_not_exists, bool):
+            raise ValueError("Invalid if_not_exists: %r" % if_not_exists)
+        if not isinstance(concurrently, bool):
+            raise ValueError("Invalid concurrently: %r" % concurrently)
+
+        expressions = list(expressions)
+        if opclasses is None:
+            opclasses = [None] * len(expressions)
+        elif isinstance(opclasses, (str, bytes)):
+            raise ValueError("opclasses must match the index expressions")
+        else:
+            try:
+                opclasses = list(opclasses)
+            except TypeError:
+                raise ValueError("opclasses must match the index expressions")
+            if len(opclasses) != len(expressions):
+                raise ValueError("opclasses must match the index expressions")
+
+        if include is None:
+            include = []
+        elif isinstance(include, (str, bytes)):
+            raise ValueError("include must be a sequence of fields")
+        else:
+            try:
+                include = list(include)
+            except TypeError:
+                raise ValueError("include must be a sequence of fields")
+
+        for opclass in opclasses:
+            if opclass is not None:
+                index_identifier(opclass, "operator class", qualified=True)
+
+        columns = []
+        for column in include:
+            if isinstance(column, str):
+                index_identifier(column, "included column")
+                try:
+                    column = table[column]
+                except KeyError:
+                    raise ValueError("Unknown included column: %s" % column)
+            if not isinstance(column, Field):
+                raise ValueError("include must contain fields or field names")
+            if column.table is not table:
+                raise ValueError("Included fields must belong to the indexed table")
+            columns.append(column._rname)
+
         uniq = " UNIQUE" if unique else ""
+        con = " CONCURRENTLY" if concurrently else ""
+        ine = " IF NOT EXISTS" if if_not_exists else ""
+        method = (
+            " USING %s" % index_identifier(using, "index method")
+            if using is not None
+            else ""
+        )
         whr = ""
         if where:
             whr = " %s" % self.where(where)
         with self.adapter.index_expander():
-            rv = "CREATE%s INDEX %s ON %s (%s)%s;" % (
+            expanded = []
+            for expression, opclass in zip(expressions, opclasses):
+                item = self.expand(expression)
+                if opclass is not None:
+                    item += " " + opclass
+                expanded.append(item)
+
+            included = " INCLUDE (%s)" % ",".join(columns) if columns else ""
+
+            rv = "CREATE%s INDEX%s%s %s ON %s%s (%s)%s%s;" % (
                 uniq,
+                con,
+                ine,
                 self.quote(name),
                 table._rname,
-                ",".join(self.expand(field) for field in expressions),
+                method,
+                ",".join(expanded),
+                included,
                 whr,
             )
         return rv
