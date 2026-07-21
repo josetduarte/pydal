@@ -13,8 +13,9 @@ from unittest import skipIf
 
 from pydal import DAL, Field
 from io import BytesIO, StringIO
+from pydal.backends.postgres import PostgresPsyco
 from pydal.utils import to_bytes
-from pydal.helpers.classes import SQLALL, OpRow
+from pydal.helpers.classes import SQLALL, OpRow, Reference
 from pydal.objects import Expression, Row, Table
 
 from ._adapt import (
@@ -3644,6 +3645,249 @@ class TestBulkInsert(DALtest):
         for pos in range(0, 10, 1):
             self.assertTrue(db(t0.name == "web2py_%s" % pos).count() == 1)
         self.assertTrue(ctr == len(items))
+
+
+class TestPostgresBulkInsertUnit(unittest.TestCase):
+    def testChunkedInsertUsesFewerExecuteCalls(self):
+        class StubField:
+            def __init__(self, name, field_type):
+                self.name = name
+                self._rname = '"%s"' % name
+                self.type = field_type
+
+        class StubTable:
+            _rname = '"bulk_item"'
+            _id = StubField("id", "id")
+
+        adapter = object.__new__(PostgresPsyco)
+        adapter.adapter_args = {"bulk_insert_size": 2}
+        adapter.expand = lambda value, field_type: "'%s'" % value
+        queries = []
+        returned_rows = iter([[(11,), (12,)], [(13,)]])
+        adapter.execute = queries.append
+        adapter.fetchall = lambda: next(returned_rows)
+        name = StubField("name", "string")
+        items = [[(name, value)] for value in ("first", "second", "third")]
+
+        identifiers = adapter.bulk_insert(StubTable, items)
+
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(
+            queries,
+            [
+                'INSERT INTO "bulk_item"("name") VALUES (\'first\'),(\'second\') RETURNING "id";',
+                'INSERT INTO "bulk_item"("name") VALUES (\'third\') RETURNING "id";',
+            ],
+        )
+        self.assertEqual([int(identifier) for identifier in identifiers], [11, 12, 13])
+        self.assertTrue(
+            all(isinstance(identifier, Reference) for identifier in identifiers)
+        )
+        self.assertTrue(
+            all(identifier._table is StubTable for identifier in identifiers)
+        )
+
+    def testEmptyInputDoesNotExecute(self):
+        adapter = object.__new__(PostgresPsyco)
+        adapter.execute = lambda query: self.fail("empty bulk insert executed SQL")
+
+        self.assertEqual(adapter.bulk_insert(object(), []), [])
+
+    def testIncompatibleShapesUsePerRowFallback(self):
+        class StubField:
+            def __init__(self, name):
+                self.name = name
+                self._rname = '"%s"' % name
+                self.type = "string"
+
+        class StubTable:
+            _rname = '"bulk_item"'
+            _id = StubField("id")
+
+        class StubPrimaryKeyTable:
+            _rname = '"bulk_keyed_item"'
+            _id = StubField("code")
+            _primarykey = ["code"]
+
+        adapter = object.__new__(PostgresPsyco)
+        inserted = []
+        adapter.insert = lambda table, item: inserted.append((table, item)) or len(inserted)
+        name = StubField("name")
+        note = StubField("note")
+        mixed_items = [[(name, "first")], [(name, "second"), (note, "noted")]]
+
+        self.assertEqual(adapter.bulk_insert(StubTable, mixed_items), [1, 2])
+        self.assertEqual(inserted, [(StubTable, item) for item in mixed_items])
+
+        inserted[:] = []
+        code = StubField("code")
+        keyed_items = [[(code, "first")], [(code, "second")]]
+        self.assertEqual(adapter.bulk_insert(StubPrimaryKeyTable, keyed_items), [1, 2])
+        self.assertEqual(
+            inserted, [(StubPrimaryKeyTable, item) for item in keyed_items]
+        )
+
+    def testInvalidChunkSizeRaises(self):
+        class StubField:
+            name = "name"
+            _rname = '"name"'
+            type = "string"
+
+        class StubTable:
+            _rname = '"bulk_item"'
+            _id = StubField()
+
+        adapter = object.__new__(PostgresPsyco)
+        adapter.adapter_args = {"bulk_insert_size": 0}
+
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            adapter.bulk_insert(StubTable, [[(StubField(), "first")]])
+
+
+@skipIf(not IS_POSTGRESQL, "PostgreSQL-only")
+class TestPostgresBulkInsert(DALtest):
+    def testChunkingIdentifiersCallbacksAndReferences(self):
+        db = self.connect(adapter_args={"bulk_insert_size": 2})
+        parent = db.define_table("postgres_bulk_parent", Field("name"))
+        item = db.define_table(
+            "postgres_bulk_item", Field("name"), Field("parent", parent)
+        )
+        parent_id = parent.insert(name="parent")
+        names = ["first", "second", "third"]
+        callbacks = []
+        item._after_insert.append(
+            lambda row, identifier: callbacks.append((row, identifier))
+        )
+        queries = []
+        original_execute = db._adapter.execute
+
+        def capture_execute(*args, **kwargs):
+            if str(args[0]).startswith("INSERT INTO %s" % item._rname):
+                queries.append(str(args[0]))
+            return original_execute(*args, **kwargs)
+
+        db._adapter.execute = capture_execute
+        try:
+            identifiers = item.bulk_insert(
+                [{"name": name, "parent": parent_id} for name in names]
+            )
+        finally:
+            db._adapter.execute = original_execute
+
+        self.assertEqual(len(queries), 2)
+        self.assertTrue(all(" RETURNING " in query for query in queries))
+        self.assertTrue(all(isinstance(identifier, Reference) for identifier in identifiers))
+        self.assertEqual([row.name for row, identifier in callbacks], names)
+        self.assertTrue(
+            all(
+                callback_identifier is identifier
+                for (row, callback_identifier), identifier in zip(
+                    callbacks, identifiers
+                )
+            )
+        )
+        rows = db(item).select(orderby=item.id)
+        self.assertEqual([row.name for row in rows], names)
+        self.assertEqual(
+            [row.id for row in rows], [int(identifier) for identifier in identifiers]
+        )
+        self.assertEqual([int(row.parent) for row in rows], [int(parent_id)] * 3)
+
+    def testEmptyInputDoesNotExecuteOrRunCallbacks(self):
+        db = self.connect(adapter_args={"bulk_insert_size": 2})
+        table = db.define_table("postgres_bulk_empty", Field("name"))
+        callbacks = []
+        table._after_insert.append(lambda row, identifier: callbacks.append(row))
+        queries = []
+        original_execute = db._adapter.execute
+
+        def capture_execute(*args, **kwargs):
+            if str(args[0]).startswith("INSERT INTO %s" % table._rname):
+                queries.append(str(args[0]))
+            return original_execute(*args, **kwargs)
+
+        db._adapter.execute = capture_execute
+        try:
+            identifiers = table.bulk_insert([])
+        finally:
+            db._adapter.execute = original_execute
+
+        self.assertEqual(identifiers, [])
+        self.assertEqual(queries, [])
+        self.assertEqual(callbacks, [])
+        self.assertEqual(db(table).count(), 0)
+
+    def testConstraintErrorPropagatesWithoutCallbacks(self):
+        db = self.connect(adapter_args={"bulk_insert_size": 10})
+        table = db.define_table(
+            "postgres_bulk_error", Field("name", unique=True)
+        )
+        callbacks = []
+        table._after_insert.append(lambda row, identifier: callbacks.append(row))
+        queries = []
+        original_execute = db._adapter.execute
+
+        def capture_execute(*args, **kwargs):
+            if str(args[0]).startswith("INSERT INTO %s" % table._rname):
+                queries.append(str(args[0]))
+            return original_execute(*args, **kwargs)
+
+        db._adapter.execute = capture_execute
+        try:
+            with self.assertRaises(db._adapter.driver.IntegrityError) as error:
+                table.bulk_insert([{"name": "duplicate"}, {"name": "duplicate"}])
+        finally:
+            db._adapter.execute = original_execute
+
+        self.assertIn("duplicate", str(error.exception).lower())
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(callbacks, [])
+        db.rollback()
+        self.assertEqual(db(table).count(), 0)
+
+    def testMixedShapesAndCustomPrimaryKeysFallBack(self):
+        db = self.connect(adapter_args={"bulk_insert_size": 100})
+        mixed = db.define_table(
+            "postgres_bulk_mixed", Field("name"), Field("note")
+        )
+        keyed = db.define_table(
+            "postgres_bulk_keyed",
+            Field("code"),
+            Field("name"),
+            primarykey=["code"],
+        )
+        queries = []
+        original_execute = db._adapter.execute
+
+        def capture_execute(*args, **kwargs):
+            command = str(args[0])
+            if command.startswith("INSERT INTO %s" % mixed._rname) or command.startswith(
+                "INSERT INTO %s" % keyed._rname
+            ):
+                queries.append(command)
+            return original_execute(*args, **kwargs)
+
+        db._adapter.execute = capture_execute
+        try:
+            mixed_ids = mixed.bulk_insert(
+                [{"name": "plain"}, {"name": "noted", "note": "note"}]
+            )
+            keyed_ids = keyed.bulk_insert(
+                [
+                    {"code": "first", "name": "First"},
+                    {"code": "second", "name": "Second"},
+                ]
+            )
+        finally:
+            db._adapter.execute = original_execute
+
+        self.assertEqual(len(queries), 4)
+        self.assertTrue(
+            all(isinstance(identifier, Reference) for identifier in mixed_ids)
+        )
+        self.assertEqual(keyed_ids, [{"code": "first"}, {"code": "second"}])
+        self.assertEqual(db(mixed).count(), 2)
+        self.assertEqual(db(keyed).count(), 2)
 
 
 class TestRecordVersioning(DALtest):

@@ -9,6 +9,7 @@ import re
 
 from .._globals import IDENTITY, THREAD_LOCAL
 from ..drivers import psycopg2_adapt
+from ..helpers.classes import Reference
 from ..utils import split_uri_args
 from ..backend_base import AdapterMeta, adapters, with_connection, with_connection_or_raise
 from ..backend_base import SQLAdapter
@@ -178,6 +179,55 @@ class Postgres(SQLAdapter, metaclass=PostgresMeta):
                 retval,
             )
         return self.dialect.insert_empty(table._rname)
+
+    def bulk_insert(self, table, items):
+        if not items:
+            return []
+
+        field_names = tuple(field.name for field, value in items[0])
+        compatible = (
+            field_names
+            and hasattr(table, "_id")
+            and not hasattr(table, "_primarykey")
+            and not hasattr(table, "_on_insert_error")
+            and all(
+                tuple(field.name for field, value in item) == field_names
+                for item in items[1:]
+            )
+        )
+        if not compatible:
+            return super(Postgres, self).bulk_insert(table, items)
+
+        chunk_size = self.adapter_args.get("bulk_insert_size", 1000)
+        if (
+            not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
+            or chunk_size < 1
+        ):
+            raise ValueError("adapter_args['bulk_insert_size'] must be a positive integer")
+
+        columns = ",".join(field._rname for field, value in items[0])
+        references = []
+        for offset in range(0, len(items), chunk_size):
+            chunk = items[offset : offset + chunk_size]
+            values = ",".join(
+                "(%s)"
+                % ",".join(self.expand(value, field.type) for field, value in item)
+                for item in chunk
+            )
+            query = "INSERT INTO %s(%s) VALUES %s RETURNING %s;" % (
+                table._rname,
+                columns,
+                values,
+                table._id._rname,
+            )
+            self._last_insert = None
+            self.execute(query)
+            for row in self.fetchall():
+                reference = Reference(row[0])
+                reference._table, reference._record = table, None
+                references.append(reference)
+        return references
 
     @with_connection
     def prepare(self, key):
