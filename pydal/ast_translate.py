@@ -40,6 +40,13 @@ _PLAIN_BINOPS = frozenset(
         "comma",
         "startswith",
         "endswith",
+        "st_contains",
+        "st_equals",
+        "st_intersects",
+        "st_overlaps",
+        "st_touches",
+        "st_within",
+        "st_distance",
         "json_key",
         "json_key_value",
         "json_path",
@@ -214,29 +221,7 @@ def _expr_to_ast(expr) -> ast.Node:
             return ast.FuncCall("count", (to_ast(f),), opts=(("distinct", True),))
         return ast.FuncCall("count", (to_ast(f),))
 
-    # ---------- GIS operations ----------
-    # Keep GIS argument types explicit. In particular, geometry literals
-    # must use the left operand's geometry/geography type while numeric and
-    # transform arguments retain their own scalar types.
-    if name in (
-        "st_contains",
-        "st_equals",
-        "st_intersects",
-        "st_overlaps",
-        "st_touches",
-        "st_within",
-    ):
-        return ast.BinOp(
-            name,
-            to_ast(f),
-            to_ast(s, type_hint=_field_type(f)),
-        )
-    if name == "st_distance":
-        return ast.BinOp(
-            name,
-            to_ast(f),
-            to_ast(s, type_hint=_field_type(f)),
-        )
+    # ---------- GIS scalar arguments ----------
     if name in ("st_simplify", "st_simplifypreservetopology"):
         return ast.BinOp(
             name,

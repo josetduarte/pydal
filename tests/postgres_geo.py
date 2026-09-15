@@ -257,12 +257,31 @@ class TestPostGISGeoCompilerResults(unittest.TestCase):
         self.assertIsInstance(self.db._adapter.compiler, PostgresPsycoCompiler)
         t = self.db[self.tablename]
         filtered = self.db(t.point.st_dwithin(t.other_point, 5.1))
-        rows = filtered.select(
-            t.point,
-            t.point.st_astext().with_alias("shape"),
-            orderby=t.id,
-        )
+        commands = []
+        driver_io = self.db._adapter.driver_io
+        execute = driver_io.execute
+
+        def capture(sql, *args, **kwargs):
+            commands.append((str(sql), getattr(sql, "params", None)))
+            return execute(sql, *args, **kwargs)
+
+        driver_io.execute = capture
+        try:
+            rows = filtered.select(
+                t.point,
+                t.point.st_astext().with_alias("shape"),
+                orderby=t.id,
+            )
+            count = filtered.count()
+        finally:
+            driver_io.execute = execute
+
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][t._tablename]["point"], "POINT(1 2)")
         self.assertEqual(rows[0]._extra["shape"], "POINT(1 2)")
-        self.assertEqual(filtered.count(), 1)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(commands), 2)
+        for sql, params in commands:
+            self.assertIn("ST_DWithin(", sql)
+            self.assertIn("%s", sql)
+            self.assertEqual(params, (5.1,))
