@@ -18,6 +18,35 @@ _TEXT_TYPES = frozenset(("string", "text", "json", "jsonb"))
 
 @compilers.register_for(Postgres)
 class PostgresCompiler(SQLCompiler):
+    def _json_operand(self, node, sql_type):
+        rendered = self.visit(node)
+        if self._ctx is not None and isinstance(node, ast.Literal):
+            rendered = "%s::%s" % (rendered, sql_type)
+        return rendered
+
+    def op_json_key(self, l, r, _):
+        key_type = "integer" if getattr(r, "type", None) == "integer" else "text"
+        return "%s->%s" % (
+            self.visit(l),
+            self._json_operand(r, key_type),
+        )
+
+    def op_json_key_value(self, l, r, _):
+        key_type = "integer" if getattr(r, "type", None) == "integer" else "text"
+        return "%s->>%s" % (
+            self.visit(l),
+            self._json_operand(r, key_type),
+        )
+
+    def op_json_path(self, l, r, _):
+        return "%s#>%s" % (self.visit(l), self._json_operand(r, "text[]"))
+
+    def op_json_path_value(self, l, r, _):
+        return "%s#>>%s" % (self.visit(l), self._json_operand(r, "text[]"))
+
+    def op_json_contains(self, l, r, _):
+        return "%s::jsonb@>%s::jsonb" % (self.visit(l), self.visit(r))
+
     def _render_insert(self, n: ast.Insert, table: str, cols: str, values: str) -> str:
         sql = super()._render_insert(n, table, cols, values)
         if self.adapter is None:
