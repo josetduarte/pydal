@@ -40,16 +40,6 @@ _PLAIN_BINOPS = frozenset(
         "comma",
         "startswith",
         "endswith",
-        "st_contains",
-        "st_equals",
-        "st_intersects",
-        "st_overlaps",
-        "st_touches",
-        "st_within",
-        "st_distance",
-        "st_simplify",
-        "st_simplifypreservetopology",
-        "st_transform",
         "json_key",
         "json_key_value",
         "json_path",
@@ -94,7 +84,12 @@ def to_ast(value: Any, type_hint: Optional[str] = None) -> ast.Node:
         # ``field._rname``, honoring user rname= and table aliasing. We
         # bake it into the node so the compiler doesn't need to walk
         # back through pydal metadata to render the column reference.
-        return ast.FieldRef(value._tablename, value.name, sqlsafe=value.sqlsafe)
+        return ast.FieldRef(
+            value._tablename,
+            value.name,
+            sqlsafe=value.sqlsafe,
+            type=value.type,
+        )
     if isinstance(value, Select):
         return _select_to_ast(value)
     if isinstance(value, (Expression, Query)):
@@ -224,13 +219,56 @@ def _expr_to_ast(expr) -> ast.Node:
             return ast.FuncCall("count", (to_ast(f),), opts=(("distinct", True),))
         return ast.FuncCall("count", (to_ast(f),))
 
+    # ---------- GIS operations ----------
+    # Keep GIS argument types explicit. In particular, geometry literals
+    # must use the left operand's geometry/geography type while numeric and
+    # transform arguments retain their own scalar types.
+    if name in (
+        "st_contains",
+        "st_equals",
+        "st_intersects",
+        "st_overlaps",
+        "st_touches",
+        "st_within",
+    ):
+        return ast.BinOp(
+            name,
+            to_ast(f),
+            to_ast(s, type_hint=_field_type(f)),
+            type="boolean",
+        )
+    if name == "st_distance":
+        return ast.BinOp(
+            name,
+            to_ast(f),
+            to_ast(s, type_hint=_field_type(f)),
+            type="double",
+        )
+    if name in ("st_simplify", "st_simplifypreservetopology"):
+        ftype = _field_type(f)
+        return ast.BinOp(
+            name,
+            to_ast(f),
+            to_ast(s, type_hint="double"),
+            type=ftype,
+        )
+    if name == "st_transform":
+        ftype = _field_type(f)
+        target_type = "integer" if isinstance(s, int) else "string"
+        return ast.BinOp(
+            name,
+            to_ast(f),
+            to_ast(s, type_hint=target_type),
+            type=ftype,
+        )
+
     # ---------- plain BinOps ----------
     if name in _PLAIN_BINOPS:
         return ast.BinOp(name, to_ast(f), to_ast(s, type_hint=_field_type(f)))
 
     # ---------- plain UnaryOps ----------
     if name in _PLAIN_UNARYOPS:
-        return ast.UnaryOp(name, to_ast(f))
+        return ast.UnaryOp(name, to_ast(f), type=getattr(expr, "type", None))
 
     # ---------- functions with structured `second` ----------
     if name == "aggregate":
@@ -282,14 +320,30 @@ def _expr_to_ast(expr) -> ast.Node:
 
     if name == "st_asgeojson":
         # second is a dict {"precision": ..., "options": ...}
+        precision = s.get("precision", 15) if isinstance(s, dict) else 15
+        options = s.get("options", 0) if isinstance(s, dict) else 0
         opts = tuple(sorted(s.items())) if isinstance(s, dict) else ()
-        return ast.FuncCall("st_asgeojson", (to_ast(f),), opts=opts)
+        return ast.FuncCall(
+            "st_asgeojson",
+            (
+                to_ast(f),
+                to_ast(precision, type_hint="integer"),
+                to_ast(options, type_hint="integer"),
+            ),
+            opts=opts,
+            type="string",
+        )
 
     if name == "st_dwithin":
         other, distance = s
         return ast.FuncCall(
             "st_dwithin",
-            (to_ast(f), to_ast(other), to_ast(distance, type_hint="double")),
+            (
+                to_ast(f),
+                to_ast(other, type_hint=_field_type(f)),
+                to_ast(distance, type_hint="double"),
+            ),
+            type="boolean",
         )
 
     # ---------- fallback: opaque function call ----------
