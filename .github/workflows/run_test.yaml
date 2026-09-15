@@ -83,6 +83,7 @@ jobs:
             python -m pip install -e .[test]
       - name: Test PostgreSQL Geo compiler
         env:
+          PYDAL_TEST_POSTGIS: "1"
           DB: postgres://pydal_test:pydal_test@localhost:5432/pydal_test
         run: |
             python -m unittest tests.postgres_geo

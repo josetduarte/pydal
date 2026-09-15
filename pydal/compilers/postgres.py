@@ -86,14 +86,10 @@ class PostgresCompiler(SQLCompiler):
     def un_st_y(self, x, _):
         return "ST_Y(%s)" % self.visit(x)
 
-    def fn_st_asgeojson(self, args, opts):
-        if len(args) == 3:
-            return "ST_AsGeoJSON(%s,%s,%s)" % tuple(self.visit(a) for a in args)
-        return "ST_AsGeoJSON(%s,%s,%s)" % (
-            self.visit(args[0]),
-            opts.get("precision", 15),
-            opts.get("options", 0),
-        )
+    def fn_st_asgeojson(self, args, _):
+        if len(args) != 3:
+            raise ValueError("st_asgeojson expects geometry, precision, and options")
+        return "ST_AsGeoJSON(%s,%s,%s)" % tuple(self.visit(a) for a in args)
 
     def fn_st_dwithin(self, args, _):
         return "ST_DWithin(%s,%s,%s)" % tuple(self.visit(a) for a in args)

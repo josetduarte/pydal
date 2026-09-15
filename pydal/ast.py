@@ -62,7 +62,6 @@ class FieldRef(Node):
     table: str
     name: str
     sqlsafe: Optional[str] = None
-    type: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -147,7 +146,6 @@ class BinOp(Node):
     left: Node
     right: Node
     opts: Opts = ()
-    type: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -165,7 +163,6 @@ class UnaryOp(Node):
     op: str
     operand: Node
     opts: Opts = ()
-    type: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -181,7 +178,6 @@ class FuncCall(Node):
     name: str
     args: Tuple[Node, ...] = ()
     opts: Opts = ()
-    type: Optional[str] = None
 
 
 @dataclass(frozen=True)

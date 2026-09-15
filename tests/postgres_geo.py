@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 
 import json
+import os
 
 from pydal import DAL, Field, geoPoint
+from pydal import ast
 from pydal.ast_translate import set_to_select, to_ast
 from pydal.backends.postgres import PostgresDialect, PostgresRepresenter
 from pydal.compilers import PostgresCompiler, PostgresPsycoCompiler
+from pydal.objects import Expression
 
 from ._adapt import DEFAULT_URI, IS_POSTGRESQL, IS_NOSQL
 from ._compat import unittest
+
+IS_POSTGIS = IS_POSTGRESQL and os.getenv("PYDAL_TEST_POSTGIS") == "1"
 
 
 @unittest.skipIf(IS_NOSQL, "PostgreSQL AST compiler is SQL-only")
@@ -101,7 +106,6 @@ class TestPostgresGeoCompiler(unittest.TestCase):
 
         simplify = to_ast(g.st_simplify(0.5))
         self.assertEqual(simplify.right.type, "double")
-        self.assertEqual(simplify.type, "geometry(POINT,4326)")
 
         transform_srid = to_ast(g.st_transform(3857))
         transform_proj4 = to_ast(g.st_transform("+proj=longlat"))
@@ -110,6 +114,22 @@ class TestPostgresGeoCompiler(unittest.TestCase):
 
         geojson = to_ast(g.st_asgeojson(6, 1))
         self.assertEqual([arg.type for arg in geojson.args[1:]], ["integer", "integer"])
+
+    def test_st_asgeojson_rejects_malformed_shapes(self):
+        g = self.db.geo.geom
+        malformed = Expression(
+            self.db,
+            self.db._adapter.dialect.st_asgeojson,
+            g,
+            {"precision": 6},
+            "string",
+        )
+        with self.assertRaises(TypeError):
+            to_ast(malformed)
+        with self.assertRaises(ValueError):
+            self._compiler().compile_expression(
+                ast.FuncCall("st_asgeojson", (to_ast(g),))
+            )
 
     def test_plain_geo_projection_and_chained_alias_compile(self):
         g = self.db.geo.geom
@@ -132,7 +152,10 @@ class TestPostgresGeoCompiler(unittest.TestCase):
         self.assertIn('ST_AsText("geo"."geom")', self._compiler().compile_select(projected))
 
 
-@unittest.skipUnless(IS_POSTGRESQL, "requires a PostGIS-enabled PostgreSQL database")
+@unittest.skipUnless(
+    IS_POSTGIS,
+    "requires PostgreSQL plus PYDAL_TEST_POSTGIS=1 for PostGIS integration",
+)
 class TestPostGISGeoCompilerResults(unittest.TestCase):
     tablename = "pydal_postgis_ast_geo"
 
@@ -229,3 +252,17 @@ class TestPostGISGeoCompilerResults(unittest.TestCase):
         )
         geojson = self._bound_value(t.point.st_asgeojson(6, 1))
         self.assertEqual(json.loads(geojson)["coordinates"], [1, 2])
+
+    def test_dal_select_count_and_geo_projection_use_ast_compiler(self):
+        self.assertIsInstance(self.db._adapter.compiler, PostgresPsycoCompiler)
+        t = self.db[self.tablename]
+        filtered = self.db(t.point.st_dwithin(t.other_point, 5.1))
+        rows = filtered.select(
+            t.point,
+            t.point.st_astext().with_alias("shape"),
+            orderby=t.id,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][t._tablename]["point"], "POINT(1 2)")
+        self.assertEqual(rows[0]._extra["shape"], "POINT(1 2)")
+        self.assertEqual(filtered.count(), 1)

@@ -84,12 +84,7 @@ def to_ast(value: Any, type_hint: Optional[str] = None) -> ast.Node:
         # ``field._rname``, honoring user rname= and table aliasing. We
         # bake it into the node so the compiler doesn't need to walk
         # back through pydal metadata to render the column reference.
-        return ast.FieldRef(
-            value._tablename,
-            value.name,
-            sqlsafe=value.sqlsafe,
-            type=value.type,
-        )
+        return ast.FieldRef(value._tablename, value.name, sqlsafe=value.sqlsafe)
     if isinstance(value, Select):
         return _select_to_ast(value)
     if isinstance(value, (Expression, Query)):
@@ -235,31 +230,25 @@ def _expr_to_ast(expr) -> ast.Node:
             name,
             to_ast(f),
             to_ast(s, type_hint=_field_type(f)),
-            type="boolean",
         )
     if name == "st_distance":
         return ast.BinOp(
             name,
             to_ast(f),
             to_ast(s, type_hint=_field_type(f)),
-            type="double",
         )
     if name in ("st_simplify", "st_simplifypreservetopology"):
-        ftype = _field_type(f)
         return ast.BinOp(
             name,
             to_ast(f),
             to_ast(s, type_hint="double"),
-            type=ftype,
         )
     if name == "st_transform":
-        ftype = _field_type(f)
         target_type = "integer" if isinstance(s, int) else "string"
         return ast.BinOp(
             name,
             to_ast(f),
             to_ast(s, type_hint=target_type),
-            type=ftype,
         )
 
     # ---------- plain BinOps ----------
@@ -268,7 +257,7 @@ def _expr_to_ast(expr) -> ast.Node:
 
     # ---------- plain UnaryOps ----------
     if name in _PLAIN_UNARYOPS:
-        return ast.UnaryOp(name, to_ast(f), type=getattr(expr, "type", None))
+        return ast.UnaryOp(name, to_ast(f))
 
     # ---------- functions with structured `second` ----------
     if name == "aggregate":
@@ -320,9 +309,13 @@ def _expr_to_ast(expr) -> ast.Node:
 
     if name == "st_asgeojson":
         # second is a dict {"precision": ..., "options": ...}
-        precision = s.get("precision", 15) if isinstance(s, dict) else 15
-        options = s.get("options", 0) if isinstance(s, dict) else 0
-        opts = tuple(sorted(s.items())) if isinstance(s, dict) else ()
+        if not isinstance(s, dict) or set(s) != {"precision", "options"}:
+            raise TypeError(
+                "st_asgeojson expects {'precision': ..., 'options': ...}"
+            )
+        precision = s["precision"]
+        options = s["options"]
+        opts = tuple(sorted(s.items()))
         return ast.FuncCall(
             "st_asgeojson",
             (
@@ -331,7 +324,6 @@ def _expr_to_ast(expr) -> ast.Node:
                 to_ast(options, type_hint="integer"),
             ),
             opts=opts,
-            type="string",
         )
 
     if name == "st_dwithin":
@@ -343,7 +335,6 @@ def _expr_to_ast(expr) -> ast.Node:
                 to_ast(other, type_hint=_field_type(f)),
                 to_ast(distance, type_hint="double"),
             ),
-            type="boolean",
         )
 
     # ---------- fallback: opaque function call ----------
