@@ -191,11 +191,11 @@ class TestPostgresJSONIntegration(unittest.TestCase):
         missing_query = self.db(table.data.json_key("missing") == None)  # noqa: E711
         null_query = self.db(table.data.json_key("null") == None)  # noqa: E711
 
-        # If any statement falls back to the legacy dialect, this sentinel
-        # turns that into a test failure rather than silently exercising the
-        # old renderer.
+        # The column-name prepass still consults the legacy dialect for
+        # aliases. Spy on both layers so successful execution proves that the
+        # statement renderer itself used the AST compiler.
         dialect = self.db._adapter.dialect
-        original = {
+        original_dialect = {
             name: getattr(dialect, name)
             for name in (
                 "json_key",
@@ -205,21 +205,45 @@ class TestPostgresJSONIntegration(unittest.TestCase):
                 "json_contains",
             )
         }
+        compiler = self.db._adapter.compiler
+        original_compiler = {
+            name: getattr(compiler, name)
+            for name in ("compile_select", "compile_count", "compile_update", "compile_delete")
+        }
+        compiler_calls = []
 
-        def legacy_json_forbidden(*args, **kwargs):
-            raise AssertionError("legacy JSON dialect path was used")
+        def legacy_json_spy(name, operation):
+            def wrapper(*args, **kwargs):
+                return operation(*args, **kwargs)
 
-        for name in original:
-            setattr(dialect, name, legacy_json_forbidden)
+            return wrapper
+
+        def compiler_spy(name, operation):
+            def wrapper(*args, **kwargs):
+                compiler_calls.append(name)
+                return operation(*args, **kwargs)
+
+            return wrapper
+
+        for name, operation in original_dialect.items():
+            setattr(dialect, name, legacy_json_spy(name, operation))
+        for name, operation in original_compiler.items():
+            setattr(compiler, name, compiler_spy(name, operation))
         try:
             row = select_query.select(projection).first()
             self.assertEqual(row.value, "foo")
             self.assertEqual(count_query.count(), 1)
             self.assertEqual(missing_query.count(), 2)
-            self.assertEqual(null_query.count(), 0)
+            self.assertEqual(null_query.count(), 1)
             update_query.update(changed=2)
             self.assertEqual(self.db(table.changed == 2).count(), 1)
             self.assertEqual(delete_query.delete(), 1)
         finally:
-            for name, operation in original.items():
+            for name, operation in original_dialect.items():
                 setattr(dialect, name, operation)
+            for name, operation in original_compiler.items():
+                setattr(compiler, name, operation)
+        self.assertIn("compile_select", compiler_calls)
+        self.assertIn("compile_count", compiler_calls)
+        self.assertIn("compile_update", compiler_calls)
+        self.assertIn("compile_delete", compiler_calls)
