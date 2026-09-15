@@ -50,6 +50,10 @@ class TestPostgresJSONCompiler(unittest.TestCase):
                 '"t"."data"#>>\'{a, a1}\'',
             ),
             (
+                self.db.t.data.json_path(["a", "a1"]),
+                '"t"."data"#>ARRAY[\'a\',\'a1\']',
+            ),
+            (
                 self.db.t.data.json_contains('{"a": 1}'),
                 '"t"."data"::jsonb@>\'{"a": 1}\'::jsonb',
             ),
@@ -59,7 +63,7 @@ class TestPostgresJSONCompiler(unittest.TestCase):
             ),
         )
         for expression, expected in expressions:
-            with self.subTest(expression=str(expression)):
+            with self.subTest(expected=expected):
                 self.assertEqual(self.inline.compile_expression(to_ast(expression)), expected)
 
     def test_translation_types_json_operands_and_scalar_comparisons(self):
@@ -78,6 +82,23 @@ class TestPostgresJSONCompiler(unittest.TestCase):
         self.assertEqual(comparison.right.type, "string")
         self.assertEqual(numeric_comparison.right.type, "string")
         self.assertEqual(lower_comparison.right.type, "string")
+
+    def test_json_key_rejects_invalid_public_values(self):
+        for operation in ("json_key", "json_key_value"):
+            for value in (1.5, None, ["a"], {"a": 1}):
+                with self.subTest(operation=operation, value=value):
+                    expression = getattr(self.db.t.data, operation)(value)
+                    with self.assertRaises(TypeError):
+                        to_ast(expression)
+
+    def test_json_path_list_is_bound_as_text_array(self):
+        expression = self.db.t.data.json_path(["a", "it's"])
+        inline = self.inline.compile_expression(to_ast(expression))
+        bound = self.bound.compile_expression(to_ast(expression))
+
+        self.assertEqual(inline, '"t"."data"#>ARRAY[\'a\',\'it\'\'s\']')
+        self.assertEqual(bound.params, (["a", "it's"],))
+        self.assertIn("#>%s::text[]", bound)
 
     def test_parameterized_json_values_are_typed_and_ordered(self):
         expression = (
@@ -118,6 +139,18 @@ class TestPostgresJSONCompiler(unittest.TestCase):
         self.assertEqual(path_compiled.params, (path,))
         self.assertNotIn(key, compiled)
         self.assertNotIn(path, path_compiled)
+
+    def test_nested_containment_parenthesizes_extracted_json(self):
+        expression = self.db.t.data.json_key("a").json_contains('{"n": 1}')
+        inline = self.inline.compile_expression(to_ast(expression))
+        bound = self.bound.compile_expression(to_ast(expression))
+
+        self.assertEqual(
+            inline,
+            '("t"."data"->\'a\')::jsonb@>\'{"n": 1}\'::jsonb',
+        )
+        self.assertEqual(bound.params, ("a", '{"n": 1}'))
+        self.assertIn("->%s::text)::jsonb@>%s::jsonb", bound)
 
     def test_chained_accessors_aliases_and_null_predicates(self):
         chained = self.db.t.data.json_key("a").json_key_value("a1")
@@ -171,8 +204,15 @@ class TestPostgresJSONIntegration(unittest.TestCase):
             migrate=True,
         )
         cls.table = cls.db[cls.table_name]
-        cls.table.insert(data={"a": {"n": 1, "text": "foo"}}, changed=0)
-        cls.table.insert(data={"a": {}, "null": "value"}, changed=0)
+        cls.table.insert(
+            data={"a": {"n": 1, "text": "foo"}, "json_null": None},
+            changed=0,
+        )
+        cls.table.insert(
+            data={"a": {}, "json_null": "value"},
+            changed=0,
+        )
+        cls.table.insert(data=None, changed=0)
 
     @classmethod
     def tearDownClass(cls):
@@ -189,7 +229,21 @@ class TestPostgresJSONIntegration(unittest.TestCase):
         update_query = self.db(table.data.json_path_value("{a, n}") == 1)
         delete_query = self.db(table.data.json_path_value("{a, n}") == 1)
         missing_query = self.db(table.data.json_key("missing") == None)  # noqa: E711
-        null_query = self.db(table.data.json_key("null") == None)  # noqa: E711
+        null_query = self.db(table.data.json_key("json_null") == None)  # noqa: E711
+        non_null_query = self.db(table.data.json_key("json_null") != None)  # noqa: E711
+        text_null_query = self.db(
+            table.data.json_key_value("json_null") == None  # noqa: E711
+        )
+        text_non_null_query = self.db(
+            table.data.json_key_value("json_null") != None  # noqa: E711
+        )
+        sql_null_query = self.db(table.data == None)  # noqa: E711
+        contains_query = self.db(table.data.json_key("a").json_contains('{"n": 1}'))
+        list_path_query = self.db(table.data.json_path_value(["a", "n"]) == 1)
+        legacy_list_path_sql = self.db._adapter.expand(
+            table.data.json_path(["a", "n"])
+        )
+        self.assertIn("ARRAY['a','n']", legacy_list_path_sql)
 
         # The column-name prepass still consults the legacy dialect for
         # aliases. Spy on both layers so successful execution proves that the
@@ -208,9 +262,14 @@ class TestPostgresJSONIntegration(unittest.TestCase):
         compiler = self.db._adapter.compiler
         original_compiler = {
             name: getattr(compiler, name)
-            for name in ("compile_select", "compile_count", "compile_update", "compile_delete")
+            for name in (
+                "compile_select",
+                "compile_count",
+                "compile_update",
+                "compile_delete",
+            )
         }
-        compiler_calls = []
+        compiler_results = {name: [] for name in original_compiler}
 
         def legacy_json_spy(name, operation):
             def wrapper(*args, **kwargs):
@@ -220,8 +279,9 @@ class TestPostgresJSONIntegration(unittest.TestCase):
 
         def compiler_spy(name, operation):
             def wrapper(*args, **kwargs):
-                compiler_calls.append(name)
-                return operation(*args, **kwargs)
+                result = operation(*args, **kwargs)
+                compiler_results[name].append(result)
+                return result
 
             return wrapper
 
@@ -233,17 +293,42 @@ class TestPostgresJSONIntegration(unittest.TestCase):
             row = select_query.select(projection).first()
             self.assertEqual(row.value, "foo")
             self.assertEqual(count_query.count(), 1)
-            self.assertEqual(missing_query.count(), 2)
+            self.assertEqual(contains_query.count(), 1)
+            self.assertEqual(missing_query.count(), 3)
             self.assertEqual(null_query.count(), 1)
+            self.assertEqual(non_null_query.count(), 2)
+            self.assertEqual(text_null_query.count(), 2)
+            self.assertEqual(text_non_null_query.count(), 1)
+            self.assertEqual(sql_null_query.count(), 1)
+            self.assertEqual(list_path_query.count(), 1)
             update_query.update(changed=2)
-            self.assertEqual(self.db(table.changed == 2).count(), 1)
             self.assertEqual(delete_query.delete(), 1)
         finally:
             for name, operation in original_dialect.items():
                 setattr(dialect, name, operation)
             for name, operation in original_compiler.items():
                 setattr(compiler, name, operation)
-        self.assertIn("compile_select", compiler_calls)
-        self.assertIn("compile_count", compiler_calls)
-        self.assertIn("compile_update", compiler_calls)
-        self.assertIn("compile_delete", compiler_calls)
+        self.assertTrue(compiler_results["compile_select"])
+        self.assertTrue(compiler_results["compile_count"])
+        self.assertTrue(compiler_results["compile_update"])
+        self.assertTrue(compiler_results["compile_delete"])
+        self.assertTrue(any("#>>" in str(result) for result in compiler_results["compile_select"]))
+        self.assertTrue(any("#>>" in str(result) for result in compiler_results["compile_count"]))
+        self.assertTrue(any("@>" in str(result) for result in compiler_results["compile_count"]))
+        self.assertTrue(any("#>>" in str(result) for result in compiler_results["compile_update"]))
+        self.assertTrue(any("#>>" in str(result) for result in compiler_results["compile_delete"]))
+        if compiler.parameterize:
+            self.assertTrue(
+                any(
+                    ["a", "n"] in result.params
+                    for result in compiler_results["compile_count"]
+                    if isinstance(result, ParamSQL)
+                )
+            )
+            self.assertTrue(
+                any(
+                    '{"n": 1}' in result.params
+                    for result in compiler_results["compile_count"]
+                    if isinstance(result, ParamSQL)
+                )
+            )

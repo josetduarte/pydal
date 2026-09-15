@@ -24,6 +24,17 @@ class PostgresCompiler(SQLCompiler):
             rendered = "%s::%s" % (rendered, sql_type)
         return rendered
 
+    def _json_path_operand(self, node):
+        if isinstance(node, ast.Literal) and node.type == "json_path":
+            if self._ctx is not None:
+                return "%s::text[]" % self._ctx.bind(node.value)
+            if self.adapter is not None and isinstance(self.adapter, PostgresPsyco):
+                return str(self.adapter.adapt(node.value))
+            return "ARRAY[%s]" % ",".join(
+                str(self._represent(value, "string")) for value in node.value
+            )
+        return self._json_operand(node, "text[]")
+
     def op_json_key(self, l, r, _):
         key_type = "integer" if getattr(r, "type", None) == "integer" else "text"
         return "%s->%s" % (
@@ -39,13 +50,16 @@ class PostgresCompiler(SQLCompiler):
         )
 
     def op_json_path(self, l, r, _):
-        return "%s#>%s" % (self.visit(l), self._json_operand(r, "text[]"))
+        return "%s#>%s" % (self.visit(l), self._json_path_operand(r))
 
     def op_json_path_value(self, l, r, _):
-        return "%s#>>%s" % (self.visit(l), self._json_operand(r, "text[]"))
+        return "%s#>>%s" % (self.visit(l), self._json_path_operand(r))
 
     def op_json_contains(self, l, r, _):
-        return "%s::jsonb@>%s::jsonb" % (self.visit(l), self.visit(r))
+        left = self.visit(l)
+        if not isinstance(l, ast.FieldRef):
+            left = "(%s)" % left
+        return "%s::jsonb@>%s::jsonb" % (left, self.visit(r))
 
     def _render_insert(self, n: ast.Insert, table: str, cols: str, values: str) -> str:
         sql = super()._render_insert(n, table, cols, values)

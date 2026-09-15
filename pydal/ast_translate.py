@@ -164,10 +164,13 @@ def _expr_to_ast(expr) -> ast.Node:
 
     # ---------- JSON operators ----------
     if name in ("json_key", "json_key_value"):
+        if not isinstance(s, (str, int)):
+            raise TypeError("Key must be a string or int")
         key_type = "integer" if isinstance(s, int) else "string"
         return ast.BinOp(name, to_ast(f), to_ast(s, type_hint=key_type))
     if name in ("json_path", "json_path_value"):
-        return ast.BinOp(name, to_ast(f), to_ast(s, type_hint="string"))
+        path_type = "json_path" if isinstance(s, list) else "string"
+        return ast.BinOp(name, to_ast(f), to_ast(s, type_hint=path_type))
     if name == "json_contains":
         # json_contains accepts an already-serialized JSON document. Keep it
         # as text so parameterized compilation does not serialize it again.
