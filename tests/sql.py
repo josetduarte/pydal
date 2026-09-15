@@ -815,7 +815,7 @@ class TestSubselect(DALtest):
                 org.name,
                 org.boss,
                 Expression(db, "0", type="integer").with_alias("xdepth"),
-                Expression(db, '" "', type="string").with_alias("boss_chain"),
+                Expression(db, "' '", type="string").with_alias("boss_chain"),
             )
             .union(
                 lambda works_for: db(
