@@ -27,6 +27,7 @@ from .objects import DialectOp, Expression, Field, Query, Select, Table
 
 # Op names that translate as straight BinOp(name, left, right) with no
 # opts and no structural transformation.
+# Specialized literal type hints are handled before the generic dispatch.
 _PLAIN_BINOPS = frozenset(
     {
         "lt",
@@ -47,6 +48,9 @@ _PLAIN_BINOPS = frozenset(
         "st_touches",
         "st_within",
         "st_distance",
+        "st_simplify",
+        "st_simplifypreservetopology",
+        "st_transform",
         "json_key",
         "json_key_value",
         "json_path",
