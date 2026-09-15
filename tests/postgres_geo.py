@@ -182,6 +182,14 @@ class TestPostGISGeoCompilerResults(unittest.TestCase):
             query = "SELECT %s FROM %s" % (sql, self.tablename)
         return self.db.executesql(query)[0][0]
 
+    def _bound_value(self, expression, wrapper=""):
+        sql = self.bound.compile_expression(to_ast(expression))
+        if wrapper:
+            query = "SELECT %s%s) FROM %s" % (wrapper, sql, self.tablename)
+        else:
+            query = "SELECT %s FROM %s" % (sql, self.tablename)
+        return self.db.executesql(query, sql.params)[0][0]
+
     def test_postgis_executes_all_geo_operations(self):
         t = self.db[self.tablename]
         self.assertEqual(self._value(t.point.st_astext()), "POINT(1 2)")
@@ -211,3 +219,13 @@ class TestPostGISGeoCompilerResults(unittest.TestCase):
         geojson = self._value(t.point.st_asgeojson(6, 1))
         self.assertEqual(json.loads(geojson)["coordinates"], [1, 2])
         self.assertTrue(self._value(t.geog.st_dwithin(geoPoint(1, 2), 0.01)))
+
+    def test_postgis_executes_bound_scalar_arguments(self):
+        t = self.db[self.tablename]
+        self.assertTrue(self._bound_value(t.point.st_dwithin(t.other_point, 5.1)))
+        self.assertEqual(
+            self._bound_value(t.point.st_transform(3857), "ST_SRID("),
+            3857,
+        )
+        geojson = self._bound_value(t.point.st_asgeojson(6, 1))
+        self.assertEqual(json.loads(geojson)["coordinates"], [1, 2])
