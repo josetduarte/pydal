@@ -30,7 +30,7 @@ class PostgresCompiler(SQLCompiler):
                 return "%s::text[]" % self._ctx.bind(node.value)
             if self.adapter is not None and isinstance(self.adapter, PostgresPsyco):
                 return str(self.adapter.adapt(node.value))
-            return "ARRAY[%s]" % ",".join(
+            return "ARRAY[%s]::text[]" % ",".join(
                 str(self._represent(value, "string")) for value in node.value
             )
         return self._json_operand(node, "text[]")

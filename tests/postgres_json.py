@@ -51,7 +51,7 @@ class TestPostgresJSONCompiler(unittest.TestCase):
             ),
             (
                 self.db.t.data.json_path(["a", "a1"]),
-                '"t"."data"#>ARRAY[\'a\',\'a1\']',
+                '"t"."data"#>ARRAY[\'a\',\'a1\']::text[]',
             ),
             (
                 self.db.t.data.json_contains('{"a": 1}'),
@@ -96,9 +96,17 @@ class TestPostgresJSONCompiler(unittest.TestCase):
         inline = self.inline.compile_expression(to_ast(expression))
         bound = self.bound.compile_expression(to_ast(expression))
 
-        self.assertEqual(inline, '"t"."data"#>ARRAY[\'a\',\'it\'\'s\']')
+        self.assertEqual(inline, '"t"."data"#>ARRAY[\'a\',\'it\'\'s\']::text[]')
         self.assertEqual(bound.params, (["a", "it's"],))
         self.assertIn("#>%s::text[]", bound)
+
+    def test_empty_json_path_list_has_an_explicit_array_type(self):
+        expression = self.db.t.data.json_path([])
+        inline = self.inline.compile_expression(to_ast(expression))
+        bound = self.bound.compile_expression(to_ast(expression))
+
+        self.assertEqual(inline, '"t"."data"#>ARRAY[]::text[]')
+        self.assertEqual(bound.params, ([],))
 
     def test_parameterized_json_values_are_typed_and_ordered(self):
         expression = (
@@ -301,7 +309,7 @@ class TestPostgresJSONIntegration(unittest.TestCase):
             self.assertEqual(text_non_null_query.count(), 1)
             self.assertEqual(sql_null_query.count(), 1)
             self.assertEqual(list_path_query.count(), 1)
-            update_query.update(changed=2)
+            self.assertEqual(update_query.update(changed=2), 1)
             self.assertEqual(delete_query.delete(), 1)
         finally:
             for name, operation in original_dialect.items():
